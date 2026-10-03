@@ -1,8 +1,12 @@
+<div align="center">
+
 # iPlayer
 
 基于 **Rust + Tauri v2** 的桌面视频播放器。
 
 ![tech](https://img.shields.io/badge/Rust-Tauri_2-orange) ![platform](https://img.shields.io/badge/platform-macOS_|_Windows_|_Linux-blue) ![license](https://img.shields.io/badge/license-MIT-green)
+
+</div>
 
 ## 功能特性
 
@@ -56,31 +60,21 @@
 
 ```bash
 npm install            # 安装 Tauri CLI
-npm run fetch:sidecar  # 将 ffmpeg/ffprobe 复制到 src-tauri/binaries（见下）
+npm run fetch:sidecar  # 准备 ffmpeg / ffprobe 二进制到 src-tauri/binaries
 npm run dev            # 开发模式
-npm run build          # 打包 .app / .dmg
+npm run build          # 当前平台一键打包（详见下方「打包」）
 ```
 
-### ffmpeg sidecar
+## 打包
 
-iPlayer 把 `ffmpeg` / `ffprobe` 作为 [Tauri sidecar](https://tauri.app/develop/sidecar/) 打包，
-文件需按 `<名称>-<目标三元组>` 命名放在 `src-tauri/binaries/`，例如：
-
+```bash
+npm run build:mac            # macOS（Apple Silicon）
+npm run build:mac:universal  # macOS 通用版（Intel + Apple Silicon）
+npm run build:win            # Windows（.exe / .msi）
+npm run build:linux          # Linux（.deb / .rpm / .AppImage）
 ```
-src-tauri/binaries/ffmpeg-aarch64-apple-darwin
-src-tauri/binaries/ffprobe-aarch64-apple-darwin
-```
 
-`npm run fetch:sidecar` 会按以下顺序获取：
-
-1. `npm i ffmpeg-static ffprobe-static` 提供的**自包含**二进制（推荐，产物可在同类机器上直接运行）
-2. 系统 `PATH` 中的 ffmpeg / ffprobe（例如 Homebrew）
-
-> 注意：若第 2 种来源来自 Homebrew，其二进制动态链接了 `/opt/homebrew` 下的 dylib，
-> 打包出的 `.app` 在没有相同依赖的机器上无法运行。此时 iPlayer 启动时会自动检测并回退到系统 PATH 中的 ffmpeg。
-> 需要完全可分发的产物时，请使用静态编译的 ffmpeg（方案 1）。
-
-运行时解析顺序：应用包内 → `src-tauri/binaries/` → 系统 `PATH`，并会用 `ffmpeg -version` 验证可用性。
+产物在 `src-tauri/target/<目标三元组>/release/bundle/`。
 
 ## 许可证
 
