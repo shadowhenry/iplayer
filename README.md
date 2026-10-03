@@ -1,6 +1,6 @@
 <div align="center">
 
-# iPlayer
+# <img src="docs/logo.png" width="40" align="middle" alt="iPlayer"/> iPlayer
 
 基于 **Rust + Tauri v2** 的桌面视频播放器。
 
