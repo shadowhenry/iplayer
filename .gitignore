@@ -1,0 +1,17 @@
+# Node
+node_modules/
+*.log
+
+# Tauri / Rust
+src-tauri/target/
+src-tauri/gen/
+
+# large sidecar binaries are fetched by `npm run fetch:sidecar`
+src-tauri/binaries/
+
+# macOS
+.DS_Store
+
+# editors
+.idea/
+.vscode/

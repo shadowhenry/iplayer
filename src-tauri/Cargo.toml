@@ -1,0 +1,39 @@
+[package]
+name = "iplayer"
+version = "0.1.0"
+description = "iPlayer — a modern desktop video player"
+authors = ["iPlayer"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "iplayer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# WebKit's WKURLSchemeTask throws an NSException when a custom-protocol response
+# is delivered after the request was cancelled (which happens constantly while
+# scrubbing a video). objc2 only survives that when the exception is turned into
+# a catchable Rust panic, which is what the `catch-all` feature does — without
+# it the foreign exception unwinds into Rust and aborts the process.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+objc2 = { version = "0.6", default-features = false, features = ["std", "catch-all"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "s"
+strip = true
+# NOTE: do *not* add `panic = "abort"` here. objc2 recovers from WebKit's
+# NSException by raising a Rust panic that has to unwind (see the note above);
+# with an abort panic strategy the process dies whenever a video seek cancels a
+# range request mid-response.
+panic = "unwind"
