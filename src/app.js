@@ -19,6 +19,60 @@
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
   const video = $("video");
+  const viz = window.Viz;
+  const Streamer = window.Streamer;
+
+  /* ---------------------------------------------------------------------- */
+  /* audio visualiser                                                       */
+  /* ---------------------------------------------------------------------- */
+
+  // The <video> element carries audio too; routing it through Web Audio lets
+  // the equaliser read the real spectrum. Created lazily on the first audio
+  // file, and only once — a MediaElementSource is permanent.
+  let audioGraph = null;
+
+  function ensureAudioGraph() {
+    if (audioGraph) {
+      if (audioGraph.ctx.state !== "running") {
+        audioGraph.ctx.resume().catch(() => {});
+      }
+      return audioGraph;
+    }
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      const ctx = new AC();
+      const source = ctx.createMediaElementSource(video);
+      const node = ctx.createAnalyser();
+      node.fftSize = 2048;
+      node.smoothingTimeConstant = 0.72;
+      node.minDecibels = -72;
+      node.maxDecibels = -18;
+      source.connect(node);
+      node.connect(ctx.destination);
+      const data = new Uint8Array(node.frequencyBinCount);
+      audioGraph = { ctx, node, data };
+      viz.attachAnalyser(node, data);
+      ctx.resume().catch(() => {});
+      return audioGraph;
+    } catch (e) {
+      // No graph → the visualiser falls back to a procedural spectrum.
+      console.warn("visualiser: Web Audio unavailable", e);
+      viz.attachAnalyser(null, null);
+      return null;
+    }
+  }
+
+  function setStageViz(on) {
+    $("app").classList.toggle("is-audio", on);
+    if (on) {
+      viz.show();
+      viz.setAudible(!video.muted && video.volume > 0.01);
+      viz.setPlaying(!video.paused);
+    } else {
+      viz.hide();
+    }
+  }
 
   /* ---------------------------------------------------------------------- */
   /* state                                                                  */
@@ -54,8 +108,23 @@
     pickingTime: false,
     toolBusy: false,
     busyKind: null,
+    // why a conversion is running + throughput anchor, so the overlay can show
+    // a reason and a rough "time left" instead of a bare percentage
+    planReason: "",
+    etaAnchor: null,
     resume: {},
     lastVolume: 1,
+    // set once we've re-encoded a file the webview refused to decode
+    retried: false,
+    // length of the file currently being live-transcoded (0 = not streaming)
+    streamDuration: 0,
+    streaming: false,
+    busyUntilPlaying: false,
+    // Ticket for the file being opened. Every `openFile` takes a new one, so a
+    // setup that is still in flight when the user moves on can tell that it no
+    // longer owns the player — and must not stop the encoder, clear the overlay
+    // or start a conversion on behalf of a file nobody is watching.
+    openSeq: 0,
   };
 
   const LS_SETTINGS = "iplayer.settings.v1";
@@ -79,6 +148,14 @@
     const s = Math.floor(sec % 60);
     if (h > 0 || forceHours) return `${pad(h)}:${pad(m)}:${pad(s)}`;
     return `${pad(m)}:${pad(s)}`;
+  }
+
+  // The timeline length. A live-transcoded stream has no `moov` duration (the
+  // header is written before the first frame is encoded), so the value the
+  // probe found is authoritative while streaming.
+  function dur() {
+    if (state.streamDuration) return state.streamDuration;
+    return isFinite(video.duration) ? video.duration : 0;
   }
 
   function formatTimecode(sec) {
@@ -382,9 +459,31 @@
     await openFile(state.files[i]);
   }
 
+  /// Everything the player owns changes hands here: the live encoder, a
+  /// derivative being built in the background, the source attached to the
+  /// element. Whatever the previous file was doing, it stops doing it now.
+  function releasePlayer() {
+    Streamer.stop();
+    cancelConversion();
+    video.removeAttribute("src");
+    try {
+      video.load();
+    } catch (_) {}
+  }
+
+  /// Ask the backend to stop building a playback derivative. Fire and forget:
+  /// the encoder is polled between progress lines, so it is gone in well under
+  /// a second and there is nothing here worth waiting for.
+  function cancelConversion() {
+    invoke("cancel_playback").catch(() => {});
+  }
+
   async function openFile(file, { autoplay = null } = {}) {
     if (file.kind === "image") return openImage(file);
     const shouldPlay = autoplay == null ? settings.autoplay : autoplay;
+
+    const seq = ++state.openSeq;
+    const stale = () => seq !== state.openSeq;
 
     // remember where we were in the outgoing file
     if (state.current && !video.paused && state.info?.duration) {
@@ -394,6 +493,15 @@
     state.current = file;
     state.info = null;
     state.plan = "direct";
+    state.retried = false;
+    state.streaming = false;
+    state.streamDuration = 0;
+    state.busyUntilPlaying = false;
+
+    // Detach whatever was playing first: a source that is about to disappear
+    // would only produce error events while we set up the next one.
+    releasePlayer();
+
     renderList();
     scrollActiveIntoView();
     showEmpty(false);
@@ -402,55 +510,174 @@
 
     setBusy(true, `正在打开 ${file.name}`, 0, "");
     state.busyKind = "media";
+    state.planReason = "";
+    state.etaAnchor = null;
 
-    let res;
+    // Probe first: it is cheap, and it tells us whether the webview can take the
+    // file as-is — and if not, exactly why.
+    let info;
     try {
-      res = await invoke("prepare_playback", { path: file.path });
+      info = await invoke("probe_media", { path: file.path });
     } catch (e) {
+      if (stale()) return;
       setBusy(false);
       state.busyKind = null;
       toast(String(e), "err", 5200);
       return;
     }
+    if (stale()) return;
+    state.info = info;
+    state.plan = info.plan;
+    state.planReason = info.plan_reason || "";
+    renderInfo();
+
+    const saved = settings.resume ? state.resume[file.path] : 0;
+    const resumeAt =
+      saved && saved > 3 && info.duration && saved < info.duration - 5 ? saved : 0;
+
+    // A video the webview cannot decode: play the re-encode instead of waiting
+    // for it. Anywhere it fails we simply fall through to the classic path.
+    if (
+      info.plan === "transcode" &&
+      info.has_video &&
+      file.kind === "video" &&
+      Streamer.supported()
+    ) {
+      let failure = null;
+      try {
+        await startStream(file, info, resumeAt);
+      } catch (e) {
+        failure = e;
+      }
+      // The user moved on while the encoder was spinning up. The new file owns
+      // the player and the encoder now — touching either would break it, and
+      // falling through would kick off a full conversion of a file nobody
+      // asked for.
+      if (stale()) return;
+      if (!failure) {
+        markStreaming(info);
+        finishOpen(file, info, shouldPlay);
+        return;
+      }
+      Streamer.stop();
+      state.streaming = false;
+      state.streamDuration = 0;
+      if (failure.code !== "NO_MSE") {
+        toast(`边转码播放失败，改用完整转换：${failure.message || failure}`, "err", 5600);
+      }
+    }
+
+    setBusy(true, `正在打开 ${file.name}`, 0, state.planReason);
+    state.busyKind = "media";
+    let res;
+    try {
+      res = await invoke("prepare_playback", { path: file.path });
+    } catch (e) {
+      if (stale()) return; // our conversion was cancelled — not an error
+      setBusy(false);
+      state.busyKind = null;
+      toast(String(e), "err", 5200);
+      return;
+    }
+    if (stale()) return;
     setBusy(false);
     state.busyKind = null;
 
     state.info = res.info;
     state.plan = res.plan;
+    state.streaming = false;
+    video.src = convertFileSrc(res.path);
+    finishOpen(file, res.info, shouldPlay, { resumeAt, cached: res.cached, plan: res.plan });
+  }
 
+  /// Start a live transcode and wait until it holds enough media to play.
+  /// Nothing about "we are streaming" is recorded here: the caller owns that,
+  /// because the wait can outlive the file it was started for.
+  async function startStream(file, info, resumeAt) {
+    state.planReason = info.plan_reason || "当前编码无法直接播放，正在生成可播放副本";
+    setBusy(
+      true,
+      `正在边转码边播放 ${file.name}`,
+      0,
+      `${state.planReason} · 正在准备前几秒`
+    );
+    state.busyKind = "media";
+    state.etaAnchor = null;
+    await Streamer.begin({
+      path: file.path,
+      start: resumeAt || 0,
+      duration: info.duration || 0,
+      video,
+    });
+    state.plan = "transcode";
+  }
+
+  /// Record that the player is now fed by a live transcode. Only ever called
+  /// once the encoder is up and this file is still the one on screen.
+  function markStreaming(info) {
+    state.streaming = true;
+    state.plan = "transcode";
+    state.streamDuration = info.duration || 0;
+    // The overlay stays until the first frame is actually on screen.
+    state.busyUntilPlaying = true;
+  }
+
+  /// Shared tail for both the streamed and the derived playback paths.
+  function finishOpen(file, info, shouldPlay, opts = {}) {
     $("app").classList.remove("is-image");
     const imgEl = $("image");
     imgEl.removeAttribute("src");
     imgEl.classList.add("hidden");
-    video.src = convertFileSrc(res.path);
+
     video.playbackRate = settings.speed;
 
-    // restore position
-    const saved = settings.resume ? state.resume[file.path] : 0;
-    if (saved && saved > 3 && res.info.duration && saved < res.info.duration - 5) {
-      const seekTo = () => {
-        video.currentTime = saved;
-        video.removeEventListener("loadedmetadata", seekTo);
-      };
-      video.addEventListener("loadedmetadata", seekTo);
+    // audio has no picture: hand the stage over to the equaliser
+    const isAudio = file.kind === "audio";
+    if (isAudio) ensureAudioGraph();
+    setStageViz(isAudio);
+
+    if (opts.resumeAt) {
+      // A live transcode already started at the resume position.
+      if (!state.streaming) {
+        const seekTo = () => {
+          video.currentTime = opts.resumeAt;
+          video.removeEventListener("loadedmetadata", seekTo);
+        };
+        video.addEventListener("loadedmetadata", seekTo);
+      }
     }
 
-    video.load();
+    // Never call load() on a MediaSource-backed element: it re-runs the media
+    // load algorithm and tears the attached buffer down.
+    if (!state.streaming) video.load();
     if (shouldPlay) {
       const p = video.play();
       if (p && p.catch) p.catch(() => {});
+    } else if (state.busyUntilPlaying) {
+      // Autoplay is off, so no `playing` event will arrive to dismiss it.
+      state.busyUntilPlaying = false;
+      setBusy(false);
+      state.busyKind = null;
     }
     renderInfo();
-    if (res.plan !== "direct") {
-      osd(res.cached ? `${planLabel(res.plan)} · 已用缓存` : planLabel(res.plan));
+    if (state.streaming) {
+      osd("边转码边播放");
+    } else if (opts.plan && opts.plan !== "direct") {
+      osd(opts.cached ? `${planLabel(opts.plan)} · 已用缓存` : planLabel(opts.plan));
     }
     refreshWindowState();
   }
 
   function openImage(file) {
+    // An image takes over from whatever was playing — including an in-flight
+    // `openFile`, which must not finish setting up a video behind our back.
+    state.openSeq++;
     if (state.current && !video.paused) {
       video.pause();
     }
+    state.streaming = false;
+    state.streamDuration = 0;
+    state.busyUntilPlaying = false;
     state.current = file;
     state.info = null;
     state.plan = "direct";
@@ -460,15 +687,18 @@
     $("tb-sub").textContent = file.name;
     document.title = `${file.name} — iPlayer`;
 
-    // stop any ongoing playback
+    // stop any ongoing playback, and any conversion running for a file we have
+    // just left behind
     video.pause();
-    video.removeAttribute("src");
-    video.load();
+    releasePlayer();
+    setBusy(false);
+    state.busyKind = null;
 
     const img = $("image");
     img.src = convertFileSrc(file.path);
     img.classList.remove("hidden");
     $("app").classList.add("is-image");
+    setStageViz(false);
 
     $("t-cur").textContent = "—";
     $("t-dur").textContent = "—";
@@ -564,7 +794,7 @@
   let seekDragging = false;
 
   function seekRatio() {
-    const d = video.duration;
+    const d = dur();
     if (!d || !isFinite(d)) return 0;
     return Math.min(1, Math.max(0, video.currentTime / d));
   }
@@ -573,16 +803,17 @@
     const r = seekRatio();
     seekPlayed.style.width = `${r * 100}%`;
     seekHandle.style.left = `${r * 100}%`;
-    if (video.buffered && video.buffered.length && video.duration) {
+    const d = dur();
+    if (video.buffered && video.buffered.length && d) {
       let end = 0;
       for (let i = 0; i < video.buffered.length; i++) {
         if (video.buffered.start(i) <= video.currentTime + 0.5) {
           end = Math.max(end, video.buffered.end(i));
         }
       }
-      seekBuffer.style.width = `${Math.min(100, (end / video.duration) * 100)}%`;
+      seekBuffer.style.width = `${Math.min(100, (end / d) * 100)}%`;
     }
-    $("t-cur").textContent = formatTime(video.currentTime, video.duration >= 3600);
+    $("t-cur").textContent = formatTime(video.currentTime, d >= 3600);
   }
 
   function ratioFromEvent(ev) {
@@ -596,18 +827,18 @@
     seek.classList.add("dragging");
     seek.setPointerCapture(ev.pointerId);
     const r = ratioFromEvent(ev);
-    if (video.duration) video.currentTime = r * video.duration;
+    if (dur()) video.currentTime = r * dur();
     paintSeek();
     seekTip.style.left = `${r * 100}%`;
-    seekTip.textContent = formatTime((video.duration || 0) * r);
+    seekTip.textContent = formatTime(dur() * r);
   });
 
   seek.addEventListener("pointermove", (ev) => {
     const r = ratioFromEvent(ev);
     seekTip.style.left = `${r * 100}%`;
-    seekTip.textContent = formatTime((video.duration || 0) * r, video.duration >= 3600);
-    if (seekDragging && video.duration) {
-      video.currentTime = r * video.duration;
+    seekTip.textContent = formatTime(dur() * r, dur() >= 3600);
+    if (seekDragging && dur()) {
+      video.currentTime = r * dur();
       paintSeek();
     }
   });
@@ -630,10 +861,22 @@
   video.addEventListener("play", () => {
     updatePlayIcon();
     osd("▶ 播放");
+    // resume() needs to happen while a user gesture is still fresh
+    if (state.current && state.current.kind === "audio") ensureAudioGraph();
+    viz.setPlaying(true);
+  });
+  // A live transcode primes the buffer before the first frame lands; the overlay
+  // stays up until playback actually starts.
+  video.addEventListener("playing", () => {
+    if (!state.busyUntilPlaying) return;
+    state.busyUntilPlaying = false;
+    setBusy(false);
+    state.busyKind = null;
   });
   video.addEventListener("pause", () => {
     updatePlayIcon();
     if (state.current) rememberPosition(state.current.path, video.currentTime);
+    viz.setPlaying(false);
   });
   video.addEventListener("timeupdate", () => {
     paintSeek();
@@ -642,15 +885,31 @@
     }
   });
   video.addEventListener("progress", paintSeek);
+  // Seeking outside the buffered range of a live transcode: re-encode from
+  // there instead of waiting for the running encoder to catch up.
+  video.addEventListener("seeking", () => {
+    if (!state.streaming || !Streamer.active()) return;
+    if (Streamer.repositioning()) return; // our own reposition, not the user's
+    const t = video.currentTime;
+    // A small overshoot is cheaper to ride out than to restart the encoder for.
+    if (!Streamer.shouldRestart(t)) return;
+    if (Streamer.requestRestart(t)) {
+      osd(`⟲ 从 ${formatTime(t, dur() >= 3600)} 重新转码`);
+    }
+  });
   video.addEventListener("durationchange", () => {
-    $("t-dur").textContent = formatTime(video.duration, video.duration >= 3600);
+    $("t-dur").textContent = formatTime(dur(), dur() >= 3600);
     paintSeek();
   });
-  video.addEventListener("volumechange", updateVolumeIcon);
+  video.addEventListener("volumechange", () => {
+    updateVolumeIcon();
+    viz.setAudible(!video.muted && video.volume > 0.01);
+  });
   video.addEventListener("ratechange", () => {
     $("speed").value = String(video.playbackRate);
   });
   video.addEventListener("ended", () => {
+    viz.setPlaying(false);
     if (state.current) rememberPosition(state.current.path, 0);
     if (settings.loop === "one") {
       video.currentTime = 0;
@@ -665,15 +924,100 @@
       nextFile(1);
     }
   });
-  video.addEventListener("error", () => {
+  video.addEventListener("error", async () => {
     const err = video.error;
     if (!err || !state.current) return;
+    // No source attached = a leftover event from a file we already closed.
+    if (!video.getAttribute("src")) return;
     const map = {
       1: "加载被中断",
       2: "网络错误",
       3: "解码失败——该编码可能不受支持",
       4: "当前格式无法播放",
     };
+
+    // Self-healing: the webview refused a file we believed it could take (10-bit
+    // H.264, 4:4:4 chroma, a container/tag it silently rejects…). Re-encode it
+    // once, then retry — the user just sees a short "converting" note instead of
+    // a dead file. A live transcode that dies mid-way gets the same treatment.
+    const file = state.current;
+    const canRetry =
+      (err.code === 3 || err.code === 4) &&
+      !state.retried &&
+      file.kind === "video" &&
+      (state.streaming || state.plan !== "transcode");
+    if (canRetry) {
+      state.retried = true;
+      // This recovery belongs to the file on screen right now; if the user
+      // moves on mid-repair, every step below has to stand down.
+      const seq = state.openSeq;
+      const stale = () => seq !== state.openSeq;
+      // Picking up where the dead stream left off beats starting over.
+      const wasStreaming = state.streaming;
+      const at = wasStreaming
+        ? Math.max(0, Math.min(video.currentTime - 2, (state.info?.duration || 0) - 1))
+        : 0;
+      Streamer.stop();
+      state.streaming = false;
+      state.streamDuration = 0;
+      try {
+        video.removeAttribute("src");
+        video.load();
+      } catch (_) {}
+      state.busyKind = "media";
+      state.planReason =
+        state.info && state.info.plan_reason
+          ? state.info.plan_reason
+          : "当前编码无法直接播放，正在生成可播放副本";
+      state.etaAnchor = null;
+
+      // Live path first: it can start playing in a couple of seconds.
+      if (state.info && state.info.has_video && Streamer.supported()) {
+        try {
+          await startStream(file, state.info, at);
+          if (stale()) return;
+          markStreaming(state.info);
+          if (settings.autoplay) {
+            const p = video.play();
+            if (p && p.catch) p.catch(() => {});
+          }
+          renderInfo();
+          return;
+        } catch (_) {
+          if (stale()) return;
+          Streamer.stop();
+          state.streaming = false;
+        }
+      }
+
+      setBusy(true, `正在转换格式 ${file.name}`, 0, state.planReason);
+      let res;
+      try {
+        res = await invoke("prepare_playback", { path: file.path, forceTranscode: true });
+      } catch (e) {
+        if (stale()) return;
+        setBusy(false);
+        state.busyKind = null;
+        toast(String(e), "err", 5200);
+        return;
+      }
+      if (stale()) return; // user moved on while we converted
+      setBusy(false);
+      state.busyKind = null;
+      state.info = res.info;
+      state.plan = res.plan;
+      video.src = convertFileSrc(res.path);
+      video.playbackRate = settings.speed;
+      video.load();
+      if (settings.autoplay) {
+        const p = video.play();
+        if (p && p.catch) p.catch(() => {});
+      }
+      renderInfo();
+      osd("已生成可播放副本");
+      return;
+    }
+
     toast(`播放失败：${map[err.code] || "未知错误"}`, "err", 5000);
   });
 
@@ -692,12 +1036,19 @@
     const rows = [
       ["文件名", f.name],
       ["路径", f.path],
-      ["播放方式", i ? planLabel(i.plan) + (state.plan !== "direct" ? "（已生成可播放副本）" : "") : "—"],
+      [
+        "播放方式",
+        i
+          ? planLabel(i.plan) +
+            (state.streaming ? "（边转码边播放）" : state.plan !== "direct" ? "（已生成可播放副本）" : "")
+          : "—",
+      ],
+      ["转换原因", i && i.plan_reason ? i.plan_reason : i ? "无需转换" : "—"],
       ["容器格式", i ? i.format_name || i.ext : "—"],
       ["时长", i ? formatTime(i.duration, true) : "—"],
       ["分辨率", i && i.width ? `${i.width} × ${i.height}` : "—"],
       ["帧率", i && i.fps ? `${i.fps.toFixed(3)} fps` : "—"],
-      ["视频编码", (i && i.vcodec) || "无"],
+      ["视频编码", i && i.vcodec ? (i.pix_fmt ? `${i.vcodec} · ${i.pix_fmt}` : i.vcodec) : "无"],
       ["音频编码", (i && i.acodec) || "无"],
       ["声道 / 采样率", i && i.has_audio ? `${i.channels} 声道 · ${i.sample_rate} Hz` : "—"],
       ["总码率", i && i.bitrate ? `${(i.bitrate / 1e6).toFixed(2)} Mbps` : "—"],
@@ -715,11 +1066,12 @@
     return [
       `文件名: ${f.name}`,
       `路径: ${f.path}`,
+      `播放方式: ${planLabel(i.plan || "direct")}${i.plan_reason ? `（${i.plan_reason}）` : ""}`,
       `容器格式: ${i.format_name || f.ext}`,
       `时长: ${formatTime(i.duration || 0, true)}`,
       `分辨率: ${i.width ? `${i.width}x${i.height}` : "—"}`,
       `帧率: ${i.fps ? i.fps.toFixed(3) : "—"}`,
-      `视频编码: ${i.vcodec || "无"}`,
+      `视频编码: ${i.vcodec ? (i.pix_fmt ? `${i.vcodec} (${i.pix_fmt})` : i.vcodec) : "无"}`,
       `音频编码: ${i.acodec || "无"}`,
       `码率: ${i.bitrate ? (i.bitrate / 1e6).toFixed(2) + " Mbps" : "—"}`,
       `大小: ${formatBytes(f.size)}`,
@@ -1004,7 +1356,7 @@
           break;
         case "ArrowRight":
           e.preventDefault();
-          video.currentTime = Math.min(video.duration || 0, video.currentTime + (e.shiftKey ? 1 : 5));
+          video.currentTime = Math.min(dur(), video.currentTime + (e.shiftKey ? 1 : 5));
           osd(`+${e.shiftKey ? 1 : 5}s`);
           break;
         case "ArrowLeft":
@@ -1190,7 +1542,7 @@
       $("shot-time").value = formatTimecode(video.currentTime || 0);
       $("gif-start").value = formatTimecode(video.currentTime || 0);
       $("gif-end").value = formatTimecode(
-        Math.min(video.duration || (video.currentTime || 0) + 5, (video.currentTime || 0) + 5)
+        Math.min(dur() || (video.currentTime || 0) + 5, (video.currentTime || 0) + 5)
       );
       openModal("shot");
     });
@@ -1377,11 +1729,33 @@
   /* progress events                                                        */
   /* ---------------------------------------------------------------------- */
 
+  // "… · 约剩 2 分钟" — the overlay should never look frozen on a long job.
+  function etaNote(percent) {
+    const a = state.etaAnchor;
+    if (!a) return "";
+    const done = (percent - a.pct) / 100;
+    if (done < 0.02) return "";
+    const elapsed = (Date.now() - a.at) / 1000;
+    const left = Math.max(0, elapsed / done - elapsed);
+    return left >= 90
+      ? `约剩 ${Math.round(left / 60)} 分钟`
+      : `约剩 ${Math.max(1, Math.round(left))} 秒`;
+  }
+
   function bindProgress() {
     listen("media-progress", (ev) => {
       if (state.busyKind !== "media") return;
-      const { percent, label } = ev.payload || {};
-      setBusy(true, label || "正在处理…", percent || 0);
+      const { percent, label, reason } = ev.payload || {};
+      if (reason) state.planReason = reason;
+      const pct = percent || 0;
+      // Re-anchor whenever a new stage starts, otherwise the estimate carries
+      // over from the previous pass (palette → render, copy → transcode…).
+      if (pct >= 0.5 && (!state.etaAnchor || state.etaAnchor.label !== label)) {
+        state.etaAnchor = { label, at: Date.now(), pct };
+      }
+      const eta = etaNote(pct);
+      const note = [state.planReason, eta].filter(Boolean).join(" · ");
+      setBusy(true, label || "正在处理…", pct, note);
     });
     listen("task-progress", (ev) => {
       const { percent, label } = ev.payload || {};
@@ -1397,6 +1771,10 @@
     detectPlatform();
     loadSettings();
     window.hydrateIcons();
+    viz.mount($("viz"));
+    Streamer.mount(video, {
+      notify: (msg) => toast(msg, "err", 6000),
+    });
     applyTheme();
     setFit(settings.fit);
     setSidebar(settings.sidebarOpen);

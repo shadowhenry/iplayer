@@ -1,6 +1,6 @@
 <div align="center">
 
-# <img src="docs/logo.png" width="34" align="middle" alt="iPlayer"/> iPlayer
+# iPlayer
 
 基于 **Rust + Tauri v2** 的桌面视频播放器。
 
@@ -13,6 +13,8 @@
 | 需求 | 实现 |
 | --- | --- |
 | 主流音视频与图片格式 | WebKit 原生格式直接播放；MKV / AVI / WMV / FLV / RMVB / TS 等通过内置 **ffmpeg sidecar** 自动处理；JPG / PNG / GIF / WebP / BMP / SVG / AVIF 等图片直接查看 |
+| 慢格式边转码边播放 | 必须重新编码的片子（WMV / MPEG / DivX / Hi10P…）**打开约 1～2 秒即开始播放**，后台持续转码；拖动进度条会从新位置重新起转，不再等待整段转换，也不占磁盘 |
+| 切换文件即时让路 | 转码途中点开另一个文件，正在跑的编码器**立刻停止**、半成品不会残留，新文件按自己的方式（直接播 / 转封装 / 边转码边播）立即接手，不会卡在前一个文件上 |
 | 左侧文件列表 | 自动扫描当前文件夹内的可播放文件，支持包含子目录、文件名筛选、类型过滤，可一键收起/展开（`Ctrl/⌘ + B`） |
 | 底部控制条 | 固定在最下方、完全不透明：播放/暂停、上一个/下一个、进度拖拽（带时间预览）、音量、倍速、循环 |
 | 主题 | 默认深色，可在设置或控制条切换「跟随系统 / 浅色 / 深色」，窗口原生外观同步变化（`Ctrl/⌘ + T` 循环切换） |
@@ -42,6 +44,8 @@
 │   ├── styles.css
 │   ├── icons.js          # 内联 SVG 图标
 │   ├── assets/           # 空状态页 logo
+│   ├── viz.js            # 音乐均衡器可视化
+│   ├── stream.js         # 边转码边播放（MediaSource 喂流）
 │   └── app.js            # 播放器逻辑
 ├── src-tauri/
 │   ├── tauri.conf.json
@@ -52,6 +56,7 @@
 │       ├── lib.rs        # 入口 & 命令注册
 │       ├── commands.rs   # Tauri 命令
 │       ├── ffmpeg.rs     # sidecar 定位与进度流式解析
+│       ├── stream.rs     # 边转码边播放的会话与管道
 │       └── media.rs      # 文件扫描 / ffprobe 探测 / 播放规划
 └── scripts/              # 图标生成 & sidecar 获取脚本
 ```

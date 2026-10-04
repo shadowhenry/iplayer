@@ -745,6 +745,8 @@ html:not([data-platform="mac"]) .win-only {
 
 #image {
   display: block;
+  width: auto;
+  height: auto;
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
@@ -752,9 +754,33 @@ html:not([data-platform="mac"]) .win-only {
   -webkit-user-drag: none;
 }
 
+/* An image on stage: the idle <video> would still take the whole first flex
+   row and push the picture aside, so take it out of the layout entirely. */
+#app.is-image #video {
+  display: none;
+}
+
 /* when an image is on stage, transport seek UI is irrelevant */
 #app.is-image .seek-row {
   visibility: hidden;
+}
+
+/* ---------------------------------------------------------------- audio ---
+   Audio files have no picture, so the stage shows a canvas equaliser instead
+   of a black rectangle. The backdrop stays dark in both themes, exactly like
+   the video stage. */
+
+#viz {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  background: radial-gradient(125% 90% at 50% 108%, #191d25 0%, #0a0c11 46%, #000 100%);
+}
+
+#viz canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
 html[data-fit="cover"] #video {

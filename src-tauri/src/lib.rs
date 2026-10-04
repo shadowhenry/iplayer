@@ -3,6 +3,7 @@
 mod commands;
 mod ffmpeg;
 mod media;
+mod stream;
 
 /// WebKit raises `NSInternalInconsistencyException` ("This task has already been
 /// stopped") when a custom-protocol response is delivered after the request was
@@ -30,13 +31,18 @@ fn install_panic_hook() {
 
 pub fn run() {
     install_panic_hook();
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::tool_status,
             commands::scan_folder,
             commands::probe_media,
             commands::prepare_playback,
+            commands::cancel_playback,
+            commands::stream_start,
+            commands::stream_read,
+            commands::stream_status,
+            commands::stream_stop,
             commands::snapshot,
             commands::extract_audio,
             commands::make_gif,
@@ -59,6 +65,15 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("启动 iPlayer 失败");
+
+    app.run(|_app, event| {
+        // Never leave an ffmpeg behind — neither a live transcode nor a
+        // derivative that happens to be half-built.
+        if let tauri::RunEvent::Exit = event {
+            commands::cancel_build();
+            stream::kill_all();
+        }
+    });
 }

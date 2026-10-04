@@ -3,7 +3,8 @@
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -150,6 +151,39 @@ pub fn h264_encoder(encoders: &[String]) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// cancellation
+// ---------------------------------------------------------------------------
+
+/// Error text a cancelled job fails with. The frontend compares against it to
+/// stay silent — nobody wants a red toast for work they deliberately left.
+pub const CANCELLED: &str = "已取消";
+
+/// A one-shot cancellation flag shared with a long-running ffmpeg job.
+///
+/// `-progress pipe:1` makes ffmpeg emit a block of `key=value` lines on a
+/// wall-clock timer (twice a second), so a job only has to look at the flag
+/// between lines to notice a cancel — no signals, no pid bookkeeping, and it
+/// reacts in a few hundred milliseconds no matter what the encoder is doing.
+#[derive(Default)]
+pub struct Cancel {
+    flag: AtomicBool,
+}
+
+impl Cancel {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn hide_console(cmd: &mut Command) {
     use std::os::windows::process::CommandExt;
@@ -182,11 +216,25 @@ pub fn base_ffprobe_command() -> Result<Command, String> {
 /// `duration` is the media duration in seconds (0 when unknown); progress is
 /// emitted on `event` as `{ "percent": f64, "label": String }`.
 pub fn run_with_progress(
+    cmd: Command,
+    app: &AppHandle,
+    event: &str,
+    duration: f64,
+    label: &str,
+) -> Result<(), String> {
+    run_cancellable(cmd, app, event, duration, label, None)
+}
+
+/// `run_with_progress`, but abortable. When `cancel` trips, the encoder is
+/// killed and `CANCELLED` comes back so the caller can drop the half-written
+/// output instead of caching it.
+pub fn run_cancellable(
     mut cmd: Command,
     app: &AppHandle,
     event: &str,
     duration: f64,
     label: &str,
+    cancel: Option<&Arc<Cancel>>,
 ) -> Result<(), String> {
     cmd.arg("-progress").arg("pipe:1").arg("-nostats");
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -210,6 +258,14 @@ pub fn run_with_progress(
 
     let reader = BufReader::new(stdout);
     for line in reader.lines().map_while(Result::ok) {
+        if let Some(c) = cancel {
+            if c.is_cancelled() {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = err_handle.join();
+                return Err(CANCELLED.to_string());
+            }
+        }
         if let Some(value) = line.strip_prefix("out_time_us=") {
             if let Ok(us) = value.trim().parse::<i64>() {
                 if us >= 0 && duration > 0.0 {

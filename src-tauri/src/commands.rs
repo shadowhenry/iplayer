@@ -3,15 +3,71 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::Serialize;
-use tauri::{AppHandle, Manager, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 
-use crate::ffmpeg::{self, ToolStatus};
+use crate::ffmpeg::{self, Cancel, ToolStatus};
 use crate::media::{self, MediaFile, MediaInfo};
+use crate::stream::{StreamStart, StreamStatus};
 
 const MEDIA_PROGRESS: &str = "media-progress";
 const TASK_PROGRESS: &str = "task-progress";
+
+// ---------------------------------------------------------------------------
+// the one derivative being built right now
+// ---------------------------------------------------------------------------
+
+/// A full re-encode takes minutes, and the user is free to wander off to another
+/// file while it runs. Only one derivative is ever worth building, so the newest
+/// request cancels whatever came before it — and the frontend can cancel too,
+/// the instant it decides the file is no longer wanted.
+static BUILDING: OnceLock<Mutex<Option<Arc<Cancel>>>> = OnceLock::new();
+
+fn building() -> &'static Mutex<Option<Arc<Cancel>>> {
+    BUILDING.get_or_init(|| Mutex::new(None))
+}
+
+/// Claim the slot for a new derivative, aborting the previous one.
+fn claim_build() -> Arc<Cancel> {
+    let token = Cancel::new();
+    if let Ok(mut slot) = building().lock() {
+        if let Some(prev) = slot.take() {
+            if !Arc::ptr_eq(&prev, &token) {
+                prev.cancel();
+            }
+        }
+        *slot = Some(token.clone());
+    }
+    token
+}
+
+/// Hand the slot back, but only if it is still ours.
+fn release_build(token: &Arc<Cancel>) {
+    if let Ok(mut slot) = building().lock() {
+        if slot.as_ref().map(|c| Arc::ptr_eq(c, token)).unwrap_or(false) {
+            *slot = None;
+        }
+    }
+}
+
+/// Stop building a derivative — the user has moved on to another file. Returns
+/// at once: the encoder notices within a fraction of a second and the caller
+/// simply drops the (partial) result.
+#[tauri::command]
+pub fn cancel_playback() {
+    if let Ok(slot) = building().lock() {
+        if let Some(c) = slot.as_ref() {
+            c.cancel();
+        }
+    }
+}
+
+/// Public alias so the app can cancel on exit as well.
+pub fn cancel_build() {
+    cancel_playback();
+}
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -104,7 +160,11 @@ pub struct PlaybackSource {
 }
 
 #[tauri::command]
-pub async fn prepare_playback(app: AppHandle, path: String) -> Result<PlaybackSource, String> {
+pub async fn prepare_playback(
+    app: AppHandle,
+    path: String,
+    force_transcode: Option<bool>,
+) -> Result<PlaybackSource, String> {
     let src = PathBuf::from(&path);
     if !src.is_file() {
         return Err(format!("文件不存在: {path}"));
@@ -117,22 +177,38 @@ pub async fn prepare_playback(app: AppHandle, path: String) -> Result<PlaybackSo
             .map_err(|e| e.to_string())??
     };
 
+    // `force_transcode` is the frontend's escape hatch: the webview refused a
+    // file we planned to play as-is (10-bit H.264, exotic profile, …). Re-encode
+    // it rather than trusting the original plan.
+    let force = force_transcode.unwrap_or(false) && info.has_video;
+    let plan = if force {
+        "transcode".to_string()
+    } else {
+        info.plan.clone()
+    };
+
     let base = PlaybackSource {
         path: path.clone(),
-        plan: info.plan.clone(),
+        plan: plan.clone(),
         cached: false,
         info: info.clone(),
     };
 
-    if info.plan == "direct" {
+    if plan == "direct" {
         allow_path(&app, &src)?;
         return Ok(base);
     }
 
     // ---- needs a derivative -------------------------------------------------
     let cache = playback_cache_dir(&app)?;
-    let key = media::cache_key(&src);
-    let ext = target_ext(&info);
+    // "v3": the planner became container-aware and remux now repairs audio
+    // tracks — derivatives from older builds can't be trusted.
+    let mut key = format!("v3{}", media::cache_key(&src));
+    if force {
+        // Keep the forced re-encode apart from the normal derivative.
+        key.push('t');
+    }
+    let ext = target_ext(&info, &plan);
     let out = cache.join(format!("{key}.{ext}"));
 
     if out.is_file() && fs::metadata(&out).map(|m| m.len() > 1024).unwrap_or(false) {
@@ -149,22 +225,52 @@ pub async fn prepare_playback(app: AppHandle, path: String) -> Result<PlaybackSo
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.clone());
-    let label = if info.plan == "remux" {
+    let label = if plan == "remux" {
         format!("正在转封装 {name}")
     } else {
         format!("正在转换格式 {name}")
     };
 
+    // Prime the overlay with *why* this file can't be handed to the webview
+    // as-is — a bare percentage on a ten-minute re-encode explains nothing.
+    let _ = app.emit(
+        MEDIA_PROGRESS,
+        serde_json::json!({
+            "percent": 0.0,
+            "label": label,
+            "reason": info.plan_reason,
+        }),
+    );
+
     let out_for_task = out.clone();
     let src_for_task = src.clone();
     let info_for_task = info.clone();
     let app_for_task = app.clone();
+    let plan_for_task = plan.clone();
+    let token = claim_build();
+    let token_for_task = token.clone();
 
-    tauri::async_runtime::spawn_blocking(move || {
-        build_derivative(&app_for_task, &src_for_task, &info_for_task, &out_for_task, &label)
+    let built = tauri::async_runtime::spawn_blocking(move || {
+        build_derivative(
+            &app_for_task,
+            &src_for_task,
+            &info_for_task,
+            &plan_for_task,
+            &out_for_task,
+            &label,
+            &token_for_task,
+        )
     })
     .await
-    .map_err(|e| e.to_string())??;
+    .map_err(|e| e.to_string())?;
+    release_build(&token);
+
+    if let Err(e) = built {
+        // A half-finished re-encode must never be left where the cache check
+        // above would happily pick it up next time.
+        let _ = fs::remove_file(&out);
+        return Err(e);
+    }
 
     allow_path(&app, &out)?;
     Ok(PlaybackSource {
@@ -174,13 +280,9 @@ pub async fn prepare_playback(app: AppHandle, path: String) -> Result<PlaybackSo
     })
 }
 
-fn target_ext(info: &MediaInfo) -> String {
-    if info.plan == "remux" {
-        if info.has_video {
-            media::remux_container(&info.vcodec).to_string()
-        } else {
-            "m4a".to_string()
-        }
+fn target_ext(info: &MediaInfo, plan: &str) -> String {
+    if plan == "remux" {
+        media::remux_target_container(&info.ext, &info.vcodec, info.has_video, &info.acodec)
     } else if !info.has_video {
         "m4a".to_string()
     } else {
@@ -192,47 +294,202 @@ fn build_derivative(
     app: &AppHandle,
     src: &Path,
     info: &MediaInfo,
+    plan: &str,
     out: &Path,
     label: &str,
+    cancel: &Arc<Cancel>,
+) -> Result<(), String> {
+    if plan == "remux" {
+        let container = out
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("mp4")
+            .to_string();
+        // Audio the target container can't carry (AC-3, DTS, Opus-in-MP4…) is
+        // re-encoded on its own; the picture is still copied untouched.
+        let audio_reencode = info.has_audio && !media::audio_fits(&container, &info.acodec);
+
+        let copy_res = run_remux(app, src, info, audio_reencode, out, label, cancel);
+        if copy_res.is_err() && cancel.is_cancelled() {
+            return copy_res;
+        }
+        // `ffmpeg -c copy` can exit 0 and still write a truncated/invalid file,
+        // so trust only a derivative we can actually probe back.
+        if copy_res.is_ok() && verify_derivative(out, info) {
+            return Ok(());
+        }
+        let copy_err = copy_res.err();
+        let _ = fs::remove_file(out);
+        let retry_label = format!("{label}（转封装失败，改用格式转换）");
+        return run_transcode(app, src, info, out, &retry_label, cancel).map_err(|e| match copy_err {
+            Some(c) => format!("{c}；重试转码仍失败: {e}"),
+            None => format!("转封装产物无法播放；重试转码仍失败: {e}"),
+        });
+    }
+
+    if info.has_video {
+        run_transcode(app, src, info, out, label, cancel)?;
+    } else {
+        run_audio_transcode(app, src, info, out, label, cancel)?;
+    }
+    if !verify_derivative(out, info) {
+        let _ = fs::remove_file(out);
+        return Err("生成的播放副本无法解析，请检查源文件是否损坏".to_string());
+    }
+    Ok(())
+}
+
+/// Make sure the derivative actually parses, carries the streams we expect and
+/// would itself be handed to the webview without further work.
+fn verify_derivative(out: &Path, info: &MediaInfo) -> bool {
+    if !out.is_file() {
+        return false;
+    }
+    match media::probe(out) {
+        Ok(p) => {
+            p.duration > 0.0
+                && p.has_video == info.has_video
+                && (!info.has_audio || p.has_audio)
+                // A `-c copy` can exit 0 and still produce something we would
+                // refuse to play (truncated `hev1`→`hvc1` retag, dropped track…).
+                && p.plan == "direct"
+        }
+        Err(_) => false,
+    }
+}
+
+/// Rewrap streams without re-encoding (`-c copy`). When the target container
+/// cannot carry the audio track as-is, only the audio is re-encoded.
+fn run_remux(
+    app: &AppHandle,
+    src: &Path,
+    info: &MediaInfo,
+    audio_reencode: bool,
+    out: &Path,
+    label: &str,
+    cancel: &Arc<Cancel>,
+) -> Result<(), String> {
+    let mut cmd = ffmpeg::base_command()?;
+    cmd.arg("-y").arg("-i").arg(src);
+    cmd.args(["-map", "0:v:0?", "-map", "0:a:0?", "-sn", "-dn"]);
+
+    if info.has_video {
+        cmd.args(["-c:v", "copy"]);
+        // WebKit only plays `hvc1`-tagged HEVC inside MP4/MOV, and `-c copy`
+        // keeps whatever tag the source carried — force the tag it expects.
+        if is_mp4_like(out) && matches!(info.vcodec.as_str(), "hevc" | "h265") {
+            cmd.args(["-tag:v", "hvc1"]);
+        }
+    }
+    if info.has_audio {
+        if audio_reencode {
+            if out.extension().and_then(|e| e.to_str()) == Some("webm") {
+                cmd.args(["-c:a", "libopus", "-b:a", "128k", "-ac", "2"]);
+            } else {
+                cmd.args(["-c:a", "aac", "-b:a", "192k", "-ac", "2"]);
+            }
+        } else {
+            cmd.args(["-c:a", "copy"]);
+        }
+    }
+    if is_mp4_like(out) {
+        cmd.args(["-movflags", "+faststart"]);
+    }
+    cmd.arg(out);
+    ffmpeg::run_cancellable(cmd, app, MEDIA_PROGRESS, info.duration, label, Some(cancel))
+}
+
+fn is_mp4_like(out: &Path) -> bool {
+    out.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e == "mp4" || e == "m4a")
+        .unwrap_or(false)
+}
+
+/// Audio-only source in an exotic container -> re-encode to AAC/m4a.
+fn run_audio_transcode(
+    app: &AppHandle,
+    src: &Path,
+    info: &MediaInfo,
+    out: &Path,
+    label: &str,
+    cancel: &Arc<Cancel>,
+) -> Result<(), String> {
+    let mut cmd = ffmpeg::base_command()?;
+    cmd.arg("-y").arg("-i").arg(src);
+    cmd.args(["-vn", "-sn", "-dn", "-c:a", "aac", "-b:a", "192k", "-ac", "2"]);
+    cmd.args(["-movflags", "+faststart"]);
+    cmd.arg(out);
+    ffmpeg::run_cancellable(cmd, app, MEDIA_PROGRESS, info.duration, label, Some(cancel))
+}
+
+/// Re-encode the video to 8-bit H.264 + AAC, which every webview can play.
+fn run_transcode(
+    app: &AppHandle,
+    src: &Path,
+    info: &MediaInfo,
+    out: &Path,
+    label: &str,
+    cancel: &Arc<Cancel>,
 ) -> Result<(), String> {
     let mut cmd = ffmpeg::base_command()?;
     cmd.arg("-y").arg("-i").arg(src);
 
-    let is_mp4_like = out
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e == "mp4" || e == "m4a")
-        .unwrap_or(false);
-
-    if info.plan == "remux" {
-        // Codecs are already web friendly — only rewrap the container.
-        cmd.args(["-c", "copy", "-sn", "-dn"]);
-        if is_mp4_like {
-            cmd.args(["-movflags", "+faststart"]);
-        }
-    } else if !info.has_video {
-        // Audio-only source in an exotic container -> re-encode to AAC/m4a.
-        cmd.args(["-vn", "-sn", "-dn", "-c:a", "aac", "-b:a", "192k", "-ac", "2"]);
-        cmd.args(["-movflags", "+faststart"]);
+    let encoders = ffmpeg::status().encoders;
+    let enc = ffmpeg::h264_encoder(&encoders);
+    cmd.args(["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn"]);
+    cmd.args(["-c:v", enc]);
+    if enc == "libx264" {
+        cmd.args(["-preset", "veryfast", "-crf", "23"]);
     } else {
-        let encoders = ffmpeg::status().encoders;
-        let enc = ffmpeg::h264_encoder(&encoders);
-        cmd.args(["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn"]);
-        cmd.args(["-c:v", enc]);
-        if enc == "libx264" {
-            cmd.args(["-preset", "veryfast", "-crf", "23"]);
-        } else {
-            cmd.args(["-b:v", "6000k", "-allow_sw", "1"]);
-        }
-        cmd.args(["-pix_fmt", "yuv420p"]);
-        if info.has_audio {
-            cmd.args(["-c:a", "aac", "-b:a", "192k", "-ac", "2"]);
-        }
-        cmd.args(["-movflags", "+faststart"]);
+        cmd.args(["-b:v", "6000k", "-allow_sw", "1"]);
     }
-
+    // 10-bit / 4:4:4 / 4:2:2 sources must come down to 8-bit 4:2:0.
+    cmd.args(["-pix_fmt", "yuv420p"]);
+    if info.has_audio {
+        cmd.args(["-c:a", "aac", "-b:a", "192k", "-ac", "2"]);
+    }
+    cmd.args(["-movflags", "+faststart"]);
     cmd.arg(out);
-    ffmpeg::run_with_progress(cmd, app, MEDIA_PROGRESS, info.duration, label)
+    ffmpeg::run_cancellable(cmd, app, MEDIA_PROGRESS, info.duration, label, Some(cancel))
+}
+
+// ---------------------------------------------------------------------------
+// live transcoding (play a re-encode while it happens)
+// ---------------------------------------------------------------------------
+
+/// Start re-encoding `path` from `start` seconds and stream the result.
+#[tauri::command]
+pub async fn stream_start(path: String, start: Option<f64>) -> Result<StreamStart, String> {
+    let start = start.unwrap_or(0.0);
+    tauri::async_runtime::spawn_blocking(move || crate::stream::start(&path, start))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Pull the next slice of the encoded stream (empty when it is finished).
+#[tauri::command]
+pub async fn stream_read(id: String, max: Option<usize>) -> Result<tauri::ipc::Response, String> {
+    let max = max.unwrap_or(crate::stream::PULL_MAX);
+    let bytes = tauri::async_runtime::spawn_blocking(move || crate::stream::pull(&id, max))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[tauri::command]
+pub async fn stream_status(id: String) -> Result<StreamStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || crate::stream::status(&id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Kill a live encoder. Off the UI thread: a synchronous command would run on
+/// the main thread, and `kill()` waits for the process to actually go away —
+/// exactly the kind of hiccup that shows up as a stutter when switching files.
+#[tauri::command]
+pub async fn stream_stop(id: String) {
+    let _ = tauri::async_runtime::spawn_blocking(move || crate::stream::stop(&id)).await;
 }
 
 // ---------------------------------------------------------------------------

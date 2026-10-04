@@ -17,14 +17,116 @@ pub const AUDIO_EXTS: &[&str] = &[
 /// Image formats the webview can render natively in `<img>`.
 pub const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "ico", "avif"];
 
-/// Containers a WebKit/Chromium webview can demux on its own.
+/// Containers a WebKit/Chromium webview can demux on its own. The whole
+/// ISO-BMFF family counts: the webview dispatches on the codec inside, not on
+/// the brand in the file header.
 const NATIVE_CONTAINERS: &[&str] = &[
-    "mp4", "m4v", "m4a", "mov", "webm", "mp3", "aac", "wav", "wave", "flac", "ogg", "oga", "opus",
+    "mp4", "m4v", "m4a", "mov", "3gp", "3g2", "f4v", "webm", "mp3", "aac", "wav", "wave", "flac",
+    "ogg", "oga", "opus",
 ];
 /// Video codecs the webview can decode.
 const NATIVE_VCODECS: &[&str] = &["h264", "avc1", "hevc", "h265", "vp8", "vp9", "av1"];
-/// Audio codecs the webview can decode.
-const NATIVE_ACODECS: &[&str] = &["aac", "mp3", "opus", "vorbis", "flac", "alac", "pcm_s16le", "pcm_s24le"];
+/// Audio codecs the webview can decode at all.
+const NATIVE_ACODECS: &[&str] = &[
+    "aac", "mp3", "opus", "vorbis", "flac", "alac", "pcm_s16le", "pcm_s24le", "pcm_s16be",
+    "pcm_f32le", "pcm_u8",
+];
+/// Audio codecs that stay decodable when *copied* into an MP4/MOV container.
+const MP4_ACODECS: &[&str] = &["aac", "mp3", "alac"];
+/// Audio codecs that stay decodable when *copied* into a WebM container.
+const WEBM_ACODECS: &[&str] = &["opus", "vorbis"];
+
+/// Can the webview demux this video codec out of this container?
+/// WebKit ships VP8/VP9/AV1 only in WebM and H.264/HEVC only in MP4/MOV.
+fn container_fits_video(container: &str, vcodec: &str) -> bool {
+    match container {
+        "mp4" | "m4v" | "mov" | "3gp" | "3g2" | "f4v" => !matches!(vcodec, "vp8" | "vp9"),
+        "webm" => !matches!(vcodec, "h264" | "avc1" | "hevc" | "h265"),
+        _ => true,
+    }
+}
+
+/// Containers that only store one timestamp per sample, i.e. no presentation
+/// timestamp at all. ffmpeg therefore *guesses* PTS from DTS when reading them,
+/// and the guess is wrong for any stream that reorders frames: copying a
+/// B-frame H.264 out of an AVI yields frames in decode order (visible judder),
+/// no matter which muxer flags are passed.
+fn container_lacks_pts(ext: &str) -> bool {
+    matches!(ext, "avi" | "divx")
+}
+
+/// Everything the planner needs to know about a probed file.
+#[derive(Clone, Copy)]
+pub struct StreamTraits<'a> {
+    pub ext: &'a str,
+    pub vcodec: &'a str,
+    pub acodec: &'a str,
+    pub pix_fmt: &'a str,
+    pub vtag: &'a str,
+    pub has_video: bool,
+    pub has_audio: bool,
+    /// Non-zero when the video stream uses B-frames.
+    pub has_b_frames: u32,
+}
+
+/// Can the webview decode this video *stream* at all, regardless of container?
+///
+/// A matching codec *name* is not enough: WebKit only ships 8-bit 4:2:0 H.264,
+/// so "H.264 Hi10P" (10-bit, ubiquitous in anime) and 4:4:4/4:2:2 material fail
+/// even though ffprobe still reports `codec_name=h264`.
+pub fn video_stream_ok(vcodec: &str, pix_fmt: &str) -> bool {
+    if !NATIVE_VCODECS.contains(&vcodec) {
+        return false;
+    }
+    // No webview decodes 4:2:2 or 4:4:4 chroma.
+    if pix_fmt.contains("444") || pix_fmt.contains("422") {
+        return false;
+    }
+    match vcodec {
+        "h264" | "avc1" => matches!(pix_fmt, "" | "yuv420p" | "yuvj420p" | "nv12"),
+        _ => true,
+    }
+}
+
+/// Can the webview play this video straight out of `container`, no rewrapping?
+fn video_playable(t: &StreamTraits) -> bool {
+    if !video_stream_ok(t.vcodec, t.pix_fmt) || !container_fits_video(t.ext, t.vcodec) {
+        return false;
+    }
+    // WebKit only accepts `hvc1`-tagged HEVC; `hev1` is rejected, but a remux can
+    // fix the tag without touching the picture.
+    if matches!(t.vcodec, "hevc" | "h265") {
+        return t.vtag.is_empty() || t.vtag == "hvc1";
+    }
+    true
+}
+
+/// Must the picture be re-encoded? Either the bitstream itself is undecodable,
+/// or its container can't express the frame order (see `container_lacks_pts`).
+pub fn needs_reencode_video(t: &StreamTraits) -> bool {
+    if !t.has_video {
+        return false;
+    }
+    !video_stream_ok(t.vcodec, t.pix_fmt) || (container_lacks_pts(t.ext) && t.has_b_frames > 0)
+}
+
+/// Can this audio stream survive a `-c copy` into `container` and still play?
+pub fn audio_fits(container: &str, acodec: &str) -> bool {
+    match container {
+        "webm" => WEBM_ACODECS.contains(&acodec),
+        // QuickTime/MOV carries linear PCM natively, and so does Safari.
+        "mp4" | "m4v" | "mov" | "m4a" | "3gp" | "3g2" | "f4v" => {
+            MP4_ACODECS.contains(&acodec) || acodec.starts_with("pcm_")
+        }
+        "ogg" | "oga" => matches!(acodec, "opus" | "vorbis" | "flac"),
+        "mp3" => acodec == "mp3",
+        "aac" => acodec == "aac",
+        "flac" => acodec == "flac",
+        "opus" => acodec == "opus",
+        "wav" | "wave" => acodec.starts_with("pcm_"),
+        other => NATIVE_CONTAINERS.contains(&other) && NATIVE_ACODECS.contains(&acodec),
+    }
+}
 
 #[derive(Serialize, Clone)]
 pub struct MediaFile {
@@ -172,6 +274,12 @@ struct ProbeStream {
     #[serde(default)]
     codec_name: String,
     #[serde(default)]
+    codec_tag_string: String,
+    #[serde(default)]
+    profile: String,
+    #[serde(default)]
+    pix_fmt: String,
+    #[serde(default)]
     width: u32,
     #[serde(default)]
     height: u32,
@@ -183,6 +291,8 @@ struct ProbeStream {
     channels: u32,
     #[serde(default)]
     sample_rate: String,
+    #[serde(default)]
+    has_b_frames: u32,
 }
 
 #[derive(Deserialize)]
@@ -216,6 +326,12 @@ pub struct MediaInfo {
     pub fps: f64,
     pub vcodec: String,
     pub acodec: String,
+    /// e.g. `yuv420p`, `yuv420p10le` — decides whether H.264 is playable at all.
+    pub pix_fmt: String,
+    /// e.g. `High`, `High 10`, `High 4:4:4 Predictive`.
+    pub profile: String,
+    /// e.g. `avc1`, `hvc1`, `hev1`.
+    pub vtag: String,
     pub format_name: String,
     pub bitrate: u64,
     pub size: u64,
@@ -223,9 +339,14 @@ pub struct MediaInfo {
     pub sample_rate: u32,
     pub has_video: bool,
     pub has_audio: bool,
+    /// >0 when the video stream reorders frames (B-frames). Matters for
+    /// containers that can't store a presentation timestamp.
+    pub has_b_frames: u32,
     /// How iPlayer will feed this file to the webview.
     /// one of: `direct` | `remux` | `transcode`
     pub plan: String,
+    /// Why a derivative is needed (empty when the file plays as-is).
+    pub plan_reason: String,
 }
 
 fn parse_fps(s: &str) -> f64 {
@@ -282,10 +403,33 @@ pub fn probe(path: &Path) -> Result<MediaInfo, String> {
 
     let vcodec = video.map(|v| v.codec_name.clone()).unwrap_or_default();
     let acodec = audio.map(|a| a.codec_name.clone()).unwrap_or_default();
+    let pix_fmt = video.map(|v| v.pix_fmt.clone()).unwrap_or_default();
+    let profile = video.map(|v| v.profile.clone()).unwrap_or_default();
+    // Matroska/AVI report the tag as "[0][0][0][0]" — meaningless for the webview.
+    let vtag = video
+        .map(|v| v.codec_tag_string.clone())
+        .unwrap_or_default();
+    let vtag = if vtag.starts_with('[') { String::new() } else { vtag };
     let has_video = video.is_some();
     let has_audio = audio.is_some();
+    let has_b_frames = video.map(|v| v.has_b_frames).unwrap_or(0);
 
-    let plan = plan_for(&ext, &vcodec, &acodec, has_video, has_audio).to_string();
+    let traits = StreamTraits {
+        ext: &ext,
+        vcodec: &vcodec,
+        acodec: &acodec,
+        pix_fmt: &pix_fmt,
+        vtag: &vtag,
+        has_video,
+        has_audio,
+        has_b_frames,
+    };
+    let plan = plan_for(&traits).to_string();
+    let plan_reason = if plan == "direct" {
+        String::new()
+    } else {
+        explain_plan(&traits)
+    };
 
     Ok(MediaInfo {
         path: path.to_string_lossy().to_string(),
@@ -306,6 +450,9 @@ pub fn probe(path: &Path) -> Result<MediaInfo, String> {
             .unwrap_or(0.0),
         vcodec,
         acodec,
+        pix_fmt,
+        profile,
+        vtag,
         format_name,
         bitrate,
         size,
@@ -315,23 +462,101 @@ pub fn probe(path: &Path) -> Result<MediaInfo, String> {
             .unwrap_or(0),
         has_video,
         has_audio,
+        has_b_frames,
         plan,
+        plan_reason,
     })
 }
 
 /// Decide how to deliver the file to the webview.
-pub fn plan_for(ext: &str, vcodec: &str, acodec: &str, has_video: bool, has_audio: bool) -> &'static str {
-    let container_ok = NATIVE_CONTAINERS.contains(&ext);
-    let v_ok = !has_video || NATIVE_VCODECS.contains(&vcodec);
-    let a_ok = !has_audio || NATIVE_ACODECS.contains(&acodec);
+///
+/// A derivative is only asked for when the webview genuinely cannot take the
+/// original. Streams that are already decodable are never re-encoded — an
+/// unsupported *audio* track, a `hev1` HEVC tag or an odd container all cost a
+/// fast `-c copy` (plus, at most, an audio-only re-encode), not a full
+/// video re-encode.
+pub fn plan_for(t: &StreamTraits) -> &'static str {
+    let direct = NATIVE_CONTAINERS.contains(&t.ext)
+        && (!t.has_video || video_playable(t))
+        && (!t.has_audio || audio_fits(t.ext, t.acodec));
+    if direct {
+        return "direct";
+    }
 
-    if container_ok && v_ok && a_ok {
-        "direct"
-    } else if v_ok && a_ok {
-        // Codecs are fine, only the container needs rewrapping — fast.
-        "remux"
-    } else {
+    // Keep the picture as-is whenever its bitstream is decodable; only the
+    // wrapping (container / tag / audio track) needs work.
+    if needs_reencode_video(t) {
         "transcode"
+    } else {
+        "remux"
+    }
+}
+
+/// Human-readable "why does this need a derivative?" note, shown in the info
+/// panel so a transcoding job is never a black box.
+pub fn explain_plan(t: &StreamTraits) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let video_fine = !needs_reencode_video(t);
+
+    if t.has_video {
+        if !video_stream_ok(t.vcodec, t.pix_fmt) {
+            if !NATIVE_VCODECS.contains(&t.vcodec) {
+                parts.push(format!("视频编码 {} 无法由播放内核解码，必须重新编码", t.vcodec));
+            } else if t.pix_fmt.contains("444") || t.pix_fmt.contains("422") {
+                parts.push(format!(
+                    "{} 的 {} 色度采样不受支持，必须重新编码",
+                    t.vcodec, t.pix_fmt
+                ));
+            } else {
+                parts.push(format!(
+                    "{} 的 {} 位深不受支持（仅支持 8-bit 4:2:0），必须重新编码",
+                    t.vcodec, t.pix_fmt
+                ));
+            }
+        } else if container_lacks_pts(t.ext) && t.has_b_frames > 0 {
+            parts.push(format!(
+                ".{} 容器不保存显示时间戳，视频含 {} 帧，重新封装会导致画面错序，必须重新编码",
+                t.ext, "B"
+            ));
+        } else if !NATIVE_CONTAINERS.contains(&t.ext) {
+            parts.push(format!("容器 .{} 需转封装为 {}", t.ext, remux_container(t.vcodec)));
+        } else if !container_fits_video(t.ext, t.vcodec) {
+            parts.push(format!("{} 不宜放在 .{} 中，需更换容器", t.vcodec, t.ext));
+        } else if matches!(t.vcodec, "hevc" | "h265") && !(t.vtag.is_empty() || t.vtag == "hvc1") {
+            parts.push(format!("HEVC 标签 {} 需改写为 hvc1", t.vtag));
+        }
+    }
+
+    // Audio-only notes are only useful when the picture is already fine.
+    if t.has_audio && video_fine {
+        let target = remux_target_container(t.ext, t.vcodec, t.has_video, t.acodec);
+        let to = if target == "webm" { "opus" } else { "aac" };
+        if !NATIVE_ACODECS.contains(&t.acodec) {
+            parts.push(format!("音轨 {} 无法解码，需转换为 {to}", t.acodec));
+        } else if !audio_fits(&target, t.acodec) {
+            parts.push(format!(
+                "音轨 {} 与 {target} 容器不兼容，需重编码为 {to}",
+                t.acodec
+            ));
+        }
+    }
+
+    if parts.is_empty() {
+        "需要生成可播放副本".to_string()
+    } else {
+        parts.join("；")
+    }
+}
+
+/// Container a `remux` plan will target for this file.
+pub fn remux_target_container(ext: &str, vcodec: &str, has_video: bool, acodec: &str) -> String {
+    if has_video {
+        return remux_container(vcodec).to_string();
+    }
+    if NATIVE_CONTAINERS.contains(&ext) && audio_fits(ext, acodec) {
+        ext.to_string()
+    } else {
+        "m4a".to_string()
     }
 }
 
@@ -416,3 +641,143 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
+
+#[cfg(test)]
+mod planner_tests {
+    use super::*;
+
+    fn p(ext: &str, v: &str, pf: &str, tag: &str, a: &str) -> &'static str {
+        t(ext, v, pf, tag, a, 0)
+    }
+
+    fn t(ext: &str, v: &str, pf: &str, tag: &str, a: &str, bf: u32) -> &'static str {
+        plan_for(&StreamTraits {
+            ext,
+            vcodec: v,
+            acodec: a,
+            pix_fmt: pf,
+            vtag: tag,
+            has_video: !v.is_empty(),
+            has_audio: !a.is_empty(),
+            has_b_frames: bf,
+        })
+    }
+
+    #[test]
+    fn matrix() {
+        let cases: &[(&str, &str)] = &[
+            // --- 主流 MP4：直接播放 ---
+            (p("mp4", "h264", "yuv420p", "avc1", "aac"), "direct"),
+            // --- MP4 里是 DivX/Xvid(MPEG-4 Part 2)：必须转码 ---
+            (p("mp4", "mpeg4", "yuv420p", "", "aac"), "transcode"),
+            // --- 10-bit H.264 (Hi10P)：必须转码 ---
+            (p("mp4", "h264", "yuv420p10le", "avc1", "aac"), "transcode"),
+            (p("mkv", "h264", "yuv420p10le", "", "aac"), "transcode"),
+            // --- 4:4:4：必须转码 ---
+            (p("mp4", "h264", "yuv444p", "avc1", "aac"), "transcode"),
+            // --- 音频不支持(AC-3/DTS)：视频直接拷贝，仅重编码音频 ---
+            (p("mp4", "h264", "yuv420p", "avc1", "ac3"), "remux"),
+            (p("mov", "h264", "yuv420p", "avc1", "dts"), "remux"),
+            (p("mp4", "h264", "yuv420p", "avc1", "eac3"), "remux"),
+            // --- HEVC hev1 标签：只需改写标签 ---
+            (p("mp4", "hevc", "yuv420p", "hev1", "aac"), "remux"),
+            (p("mp4", "hevc", "yuv420p", "hvc1", "aac"), "direct"),
+            // --- MKV / RMVB：转封装 ---
+            (p("mkv", "h264", "yuv420p", "", "aac"), "remux"),
+            (p("mkv", "h264", "yuv420p", "", "flac"), "remux"),
+            (p("mkv", "h264", "yuv420p", "", "opus"), "remux"),
+            (p("rmvb", "rv40", "yuv420p", "", "cook"), "transcode"),
+            // --- AVI：无 B 帧可转封装，有 B 帧必须转码（AVI 存不了 PTS）---
+            (t("avi", "h264", "yuv420p", "H264", "mp3", 0), "remux"),
+            (t("avi", "h264", "yuv420p", "H264", "mp3", 2), "transcode"),
+            (t("avi", "h264", "yuv420p", "H264", "pcm_s16le", 0), "remux"),
+            (p("avi", "mpeg4", "yuv420p", "FMP4", "mp3"), "transcode"),
+            (p("avi", "mjpeg", "yuvj444p", "MJPG", "pcm_s16le"), "transcode"),
+            // --- FLV：h264 可转封装（FLV 能存显示时间戳），老式 flv1 必须转码 ---
+            (t("flv", "h264", "yuv420p", "", "aac", 2), "remux"),
+            (p("flv", "flv1", "yuv420p", "", "mp3"), "transcode"),
+            // --- WMV / VC-1：一律转码 ---
+            (p("wmv", "wmv2", "yuv420p", "WMV2", "wmav2"), "transcode"),
+            (p("wmv", "vc1", "yuv420p", "", "wmav2"), "transcode"),
+            (p("asf", "msmpeg4v2", "yuv420p", "MP42", "wmav2"), "transcode"),
+            // --- VP9/AV1 在 MP4 里要换到 WebM ---
+            (p("mp4", "vp9", "yuv420p", "", "opus"), "remux"),
+            (p("webm", "vp9", "yuv420p", "", "opus"), "direct"),
+            (p("webm", "h264", "yuv420p", "", "aac"), "remux"),
+            // --- ISO-BMFF 家族（3gp/3g2/f4v）与 mp4 同等待遇 ---
+            (p("3gp", "h264", "yuv420p", "avc1", "aac"), "direct"),
+            (p("3g2", "h264", "yuv420p", "avc1", "aac"), "direct"),
+            (p("f4v", "h264", "yuv420p", "avc1", "aac"), "direct"),
+            // 3GP 常见的老编码与 AMR 音轨：转封装（音轨转 aac）
+            (p("3gp", "h263", "yuv420p", "s263", "samr"), "transcode"),
+            (p("3gp", "mpeg4", "yuv420p", "", "samr"), "transcode"),
+            (t("3gp", "h264", "yuv420p", "avc1", "samr", 1), "remux"),
+            // --- MPEG-TS / 老容器：一律转封装起步 ---
+            (p("ts", "h264", "yuv420p", "", "aac"), "remux"),
+            (p("m2ts", "h264", "yuv420p", "", "ac3"), "remux"),
+            (p("mpg", "mpeg2video", "yuv420p", "", "mp2"), "transcode"),
+            (p("vob", "mpeg2video", "yuv420p", "", "ac3"), "transcode"),
+            (p("dv", "dvvideo", "yuv420p", "", "pcm_s16le"), "transcode"),
+            (p("ogv", "theora", "yuv420p", "", "vorbis"), "transcode"),
+            (p("amv", "amv", "yuv420p", "", "adpcm_ima_amv"), "transcode"),
+            (p("mxf", "mpeg2video", "yuv420p", "", "pcm_s16le"), "transcode"),
+            (p("rm", "rv30", "yuv420p", "", "cook"), "transcode"),
+            // --- 仅音频 ---
+            (p("mp3", "", "", "", "mp3"), "direct"),
+            (p("flac", "", "", "", "flac"), "direct"),
+            (p("ape", "", "", "", "ape"), "remux"),
+            (p("mka", "", "", "", "opus"), "remux"),
+        ];
+        let mut bad = Vec::new();
+        for (got, want) in cases {
+            if got != want {
+                bad.push(format!("want {want}, got {got}"));
+            }
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
+    #[test]
+    fn audio_container_fit() {
+        assert!(audio_fits("mp4", "aac"));
+        assert!(audio_fits("mov", "pcm_s16le"));
+        assert!(!audio_fits("mp4", "ac3"));
+        assert!(!audio_fits("mp4", "opus"));
+        assert!(!audio_fits("mp4", "flac"));
+        assert!(audio_fits("webm", "opus"));
+        assert!(!audio_fits("webm", "aac"));
+        assert!(audio_fits("flac", "flac"));
+        assert_eq!(remux_target_container("mkv", "h264", true, "aac"), "mp4");
+        assert_eq!(remux_target_container("mp4", "vp9", true, "opus"), "webm");
+        assert_eq!(remux_target_container("ape", "", false, "ape"), "m4a");
+    }
+
+    fn why(ext: &str, v: &str, pf: &str, tag: &str, a: &str, bf: u32) -> String {
+        explain_plan(&StreamTraits {
+            ext,
+            vcodec: v,
+            acodec: a,
+            pix_fmt: pf,
+            vtag: tag,
+            has_video: !v.is_empty(),
+            has_audio: !a.is_empty(),
+            has_b_frames: bf,
+        })
+    }
+
+    #[test]
+    fn reasons() {
+        let r = why("mp4", "mpeg4", "yuv420p", "", "aac", 0);
+        assert!(r.contains("mpeg4"), "{r}");
+        let r = why("mp4", "h264", "yuv420p", "avc1", "ac3", 0);
+        assert!(r.contains("ac3"), "{r}");
+        assert!(!r.contains("视频"), "{r}");
+        let r = why("mkv", "h264", "yuv420p", "", "aac", 0);
+        assert!(r.contains("转封装"), "{r}");
+        // AVI + B 帧的解释必须点到「不保存显示时间戳」
+        let r = why("avi", "h264", "yuv420p", "", "mp3", 2);
+        assert!(r.contains("显示时间戳"), "{r}");
+        assert!(r.contains("必须重新编码"), "{r}");
+    }
+}
+
