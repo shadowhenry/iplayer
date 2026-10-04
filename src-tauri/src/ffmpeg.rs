@@ -43,9 +43,12 @@ fn candidates(name: &str) -> Vec<PathBuf> {
             // Bundled: next to the main binary (Contents/MacOS/…)
             out.push(dir.join(name));
             out.push(dir.join(format!("{name}-{TARGET_TRIPLE}")));
+            out.push(dir.join(format!("{name}-universal-apple-darwin")));
             // Bundled alternative: Contents/Resources/…
             if let Some(contents) = dir.parent() {
                 out.push(contents.join("Resources").join(name));
+                out.push(contents.join("Resources").join(format!("{name}-{TARGET_TRIPLE}")));
+                out.push(contents.join("Resources").join(format!("{name}-universal-apple-darwin")));
             }
         }
     }
