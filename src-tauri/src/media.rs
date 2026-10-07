@@ -26,13 +26,18 @@ const NATIVE_CONTAINERS: &[&str] = &[
 ];
 /// Video codecs the webview can decode.
 const NATIVE_VCODECS: &[&str] = &["h264", "avc1", "hevc", "h265", "vp8", "vp9", "av1"];
-/// Audio codecs the webview can decode at all.
+/// Audio codecs the webview can decode at all. On macOS the webview decodes
+/// through AVFoundation, which *does* ship an AC-3/E-AC-3 decoder — so these
+/// two count as decodable even though Chromium-based engines lack them. DTS is
+/// deliberately absent: WebKit accepts the container and then plays silence.
 const NATIVE_ACODECS: &[&str] = &[
-    "aac", "mp3", "opus", "vorbis", "flac", "alac", "pcm_s16le", "pcm_s24le", "pcm_s16be",
-    "pcm_f32le", "pcm_u8",
+    "aac", "mp3", "opus", "vorbis", "flac", "alac", "ac3", "eac3", "pcm_s16le", "pcm_s24le",
+    "pcm_s16be", "pcm_f32le", "pcm_u8",
 ];
 /// Audio codecs that stay decodable when *copied* into an MP4/MOV container.
-const MP4_ACODECS: &[&str] = &["aac", "mp3", "alac"];
+/// AC-3/E-AC-3 only ever need rewrapping, never a re-encode (verified by
+/// playback: a 5.1 AC-3 track copied into MP4/MOV decodes with real output).
+const MP4_ACODECS: &[&str] = &["aac", "mp3", "alac", "ac3", "eac3"];
 /// Audio codecs that stay decodable when *copied* into a WebM container.
 const WEBM_ACODECS: &[&str] = &["opus", "vorbis"];
 
@@ -675,10 +680,17 @@ mod planner_tests {
             (p("mkv", "h264", "yuv420p10le", "", "aac"), "transcode"),
             // --- 4:4:4：必须转码 ---
             (p("mp4", "h264", "yuv444p", "avc1", "aac"), "transcode"),
-            // --- 音频不支持(AC-3/DTS)：视频直接拷贝，仅重编码音频 ---
-            (p("mp4", "h264", "yuv420p", "avc1", "ac3"), "remux"),
+            // --- 音频不支持(DTS)：视频直接拷贝，仅重编码音频 ---
             (p("mov", "h264", "yuv420p", "avc1", "dts"), "remux"),
-            (p("mp4", "h264", "yuv420p", "avc1", "eac3"), "remux"),
+            // --- AC-3/E-AC-3：WebKit(macOS) 走 AVFoundation 自带解码器，
+            //     MP4 里连音频都无需重编码 → 直接播放 ---
+            (p("mp4", "h264", "yuv420p", "avc1", "ac3"), "direct"),
+            (p("mp4", "h264", "yuv420p", "avc1", "eac3"), "direct"),
+            (p("mov", "h264", "yuv420p", "avc1", "ac3"), "direct"),
+            // 裸 .ac3 不是 WebView 认识的容器，需换封装（音轨仍 -c copy）
+            (p("ac3", "", "", "", "ac3"), "remux"),
+            (p("mkv", "h264", "yuv420p", "", "ac3"), "remux"),
+            (p("mkv", "h264", "yuv420p", "", "dts"), "remux"),
             // --- HEVC hev1 标签：只需改写标签 ---
             (p("mp4", "hevc", "yuv420p", "hev1", "aac"), "remux"),
             (p("mp4", "hevc", "yuv420p", "hvc1", "aac"), "direct"),
@@ -741,15 +753,23 @@ mod planner_tests {
     fn audio_container_fit() {
         assert!(audio_fits("mp4", "aac"));
         assert!(audio_fits("mov", "pcm_s16le"));
-        assert!(!audio_fits("mp4", "ac3"));
+        // AC-3/E-AC-3 能被 MP4/MOV 承载并解码；DTS 不能，Opus/FLAC 装不进 MP4。
+        assert!(audio_fits("mp4", "ac3"));
+        assert!(audio_fits("mp4", "eac3"));
+        assert!(audio_fits("mov", "ac3"));
+        assert!(!audio_fits("mp4", "dts"));
         assert!(!audio_fits("mp4", "opus"));
         assert!(!audio_fits("mp4", "flac"));
         assert!(audio_fits("webm", "opus"));
         assert!(!audio_fits("webm", "aac"));
+        // WebM 装不下 AC-3，仍需转成 opus。
+        assert!(!audio_fits("webm", "ac3"));
         assert!(audio_fits("flac", "flac"));
         assert_eq!(remux_target_container("mkv", "h264", true, "aac"), "mp4");
+        assert_eq!(remux_target_container("mkv", "h264", true, "ac3"), "mp4");
         assert_eq!(remux_target_container("mp4", "vp9", true, "opus"), "webm");
         assert_eq!(remux_target_container("ape", "", false, "ape"), "m4a");
+        assert_eq!(remux_target_container("ac3", "", false, "ac3"), "m4a");
     }
 
     fn why(ext: &str, v: &str, pf: &str, tag: &str, a: &str, bf: u32) -> String {
@@ -769,9 +789,15 @@ mod planner_tests {
     fn reasons() {
         let r = why("mp4", "mpeg4", "yuv420p", "", "aac", 0);
         assert!(r.contains("mpeg4"), "{r}");
-        let r = why("mp4", "h264", "yuv420p", "avc1", "ac3", 0);
-        assert!(r.contains("ac3"), "{r}");
+        // DTS 仍然是"无法解码，需转换"的那一类。
+        let r = why("mp4", "h264", "yuv420p", "avc1", "dts", 0);
+        assert!(r.contains("dts"), "{r}");
         assert!(!r.contains("视频"), "{r}");
+        // AC-3 不再被当成缺陷：m2ts 只解释容器问题，不提音频。
+        let r = why("m2ts", "h264", "yuv420p", "", "ac3", 0);
+        assert!(r.contains("转封装"), "{r}");
+        assert!(!r.contains("ac3"), "{r}");
+        assert!(!r.contains("音轨"), "{r}");
         let r = why("mkv", "h264", "yuv420p", "", "aac", 0);
         assert!(r.contains("转封装"), "{r}");
         // AVI + B 帧的解释必须点到「不保存显示时间戳」

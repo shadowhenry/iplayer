@@ -305,8 +305,9 @@ fn build_derivative(
             .and_then(|e| e.to_str())
             .unwrap_or("mp4")
             .to_string();
-        // Audio the target container can't carry (AC-3, DTS, Opus-in-MP4…) is
-        // re-encoded on its own; the picture is still copied untouched.
+        // Audio the target container can't carry (DTS, Opus-in-MP4, raw PCM in
+        // WebM…) is re-encoded on its own; the picture is still copied untouched.
+        // AC-3/E-AC-3 need no re-encode at all — see `MP4_ACODECS`.
         let audio_reencode = info.has_audio && !media::audio_fits(&container, &info.acodec);
 
         let copy_res = run_remux(app, src, info, audio_reencode, out, label, cancel);
