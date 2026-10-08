@@ -9,7 +9,7 @@ import sys
 from PIL import Image, ImageDraw
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ICON_DIR = os.path.join(ROOT, "src-tauri", "icons")
+ICON_DIR = os.path.join(ROOT, "icons")
 
 SS = 4  # supersampling factor
 

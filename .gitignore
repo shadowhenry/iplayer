@@ -1,13 +1,8 @@
-# Node
-node_modules/
-*.log
+# Rust
+/target/
 
-# Tauri / Rust
-src-tauri/target/
-src-tauri/gen/
-
-# large sidecar binaries are fetched by `npm run fetch:sidecar`
-src-tauri/binaries/
+# 大体积 sidecar（ffmpeg/ffprobe 静态构建），不入库
+/binaries/
 
 # macOS
 .DS_Store
@@ -15,3 +10,6 @@ src-tauri/binaries/
 # editors
 .idea/
 .vscode/
+
+# 打包产物（scripts/bundle-macos.sh）
+/dist/
