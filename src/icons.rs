@@ -34,7 +34,9 @@ pub fn source(name: &str) -> Option<String> {
     let s = stroke;
     let f = fill;
     Some(match name {
-        "panelLeft" => s("<rect x=\"3\" y=\"3\" width=\"18\" height=\"18\" rx=\"2.5\"/><path d=\"M9.5 3v18\"/>"),
+        // 分隔线画在 24 网格的**正中**（x=12）—— 用户明确要求中间那条线居中，
+        // 原来的 Lucide 原版是 x=9.5，视觉上明显偏左。
+        "panelLeft" => s("<rect x=\"3\" y=\"3\" width=\"18\" height=\"18\" rx=\"2.5\"/><path d=\"M12 3v18\"/>"),
         "pin" => s("<path d=\"M12 17v5\"/><path d=\"M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z\"/>"),
         "sun" => s("<circle cx=\"12\" cy=\"12\" r=\"4\"/><path d=\"M12 2v2\"/><path d=\"M12 20v2\"/><path d=\"m4.9 4.9 1.4 1.4\"/><path d=\"m17.7 17.7 1.4 1.4\"/><path d=\"M2 12h2\"/><path d=\"M20 12h2\"/><path d=\"m6.3 17.7-1.4 1.4\"/><path d=\"m19.1 4.9-1.4 1.4\"/>"),
         "moon" => s("<path d=\"M20 14.5A8.5 8.5 0 0 1 9.5 4a7 7 0 1 0 10.5 10.5\"/>"),
@@ -60,6 +62,11 @@ pub fn source(name: &str) -> Option<String> {
         "image" => s("<rect x=\"3\" y=\"3\" width=\"18\" height=\"18\" rx=\"2.5\"/><circle cx=\"8.8\" cy=\"8.8\" r=\"1.9\"/><path d=\"m21 15.5-4.6-4.6L5 21\"/>"),
         "download" => s("<path d=\"M12 3v12\"/><path d=\"m7.2 10.2 4.8 4.8 4.8-4.8\"/><path d=\"M4.5 21h15\"/>"),
         "crop" => s("<path d=\"M6 2.5v13.5a2 2 0 0 0 2 2h13.5\"/><path d=\"M18 21.5V8a2 2 0 0 0-2-2H2.5\"/>"),
+        // 画面角度：逆时针的环形箭头（lucide `rotate-ccw` 的弧线版，
+        // 圆弧闭合、箭头贴弧线末端 —— 比早期那版"缺口弧+悬空角标"耐看）
+        "rotate" => s("<path d=\"M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8\"/><path d=\"M3 3v5h5\"/>"),
+        // 关联 / 设为默认播放器：一节链条
+        "link" => s("<path d=\"M9.5 14.5a3.5 3.5 0 0 0 5 0l3.5-3.5a3.54 3.54 0 0 0-5-5l-1.2 1.2\"/><path d=\"M14.5 9.5a3.5 3.5 0 0 0-5 0L6 13a3.54 3.54 0 0 0 5 5l1.2-1.2\"/>"),
         "close" => s("<path d=\"M18 6 6 18\"/><path d=\"m6 6 12 12\"/>"),
         _ => return None,
     })
@@ -71,7 +78,7 @@ pub const ALL: &[&str] = &[
     "panelLeft", "pin", "sun", "moon", "folder", "film", "refresh", "search",
     "play", "pause", "prev", "next", "stop", "volume", "volumeX", "info",
     "repeat", "repeat1", "camera", "toolbox", "gif", "expand", "music",
-    "image", "download", "crop", "close",
+    "image", "download", "crop", "rotate", "link", "close",
 ];
 
 type Cache = HashMap<(String, u32, String), Arc<RenderImage>>;
@@ -140,5 +147,19 @@ mod tests {
     fn hex_of_converts() {
         assert_eq!(hex_of(Hsla::black()), "#000000");
         assert_eq!(hex_of(Hsla::white()), "#ffffff");
+    }
+
+    /// 侧栏开关图标的竖分隔线必须在 24 网格正中（曾偏左到 9.5，被用户挑出来过）。
+    #[test]
+    fn sidebar_icon_divider_is_centred() {
+        let src = source("panelLeft").expect("panelLeft 应当存在");
+        assert!(
+            src.contains("M12 3v18"),
+            "分隔线应当落在 x=12（正中），实际图标源：{src}"
+        );
+        assert!(
+            !src.contains("M9.5 3v18"),
+            "不能再用偏左的 x=9.5 分隔线"
+        );
     }
 }

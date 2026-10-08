@@ -214,6 +214,7 @@ fn band_bins(i: usize, bands: usize, bins: usize) -> (usize, usize) {
 }
 
 /// 第 `i` 个频段覆盖的频率区间（Hz）。给测试和调试用。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn band_hz(i: usize, bands: usize, rate: f32) -> (f32, f32) {
     let (a, b) = band_bins(i, bands, WINDOW / 2);
     let hz = rate / WINDOW as f32;

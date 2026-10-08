@@ -119,7 +119,10 @@ fn notes_spawn_and_cull() {
     }
     let n_playing = v.notes.len();
     assert!(n_playing > 0, "播放时应当有音符");
-    assert!(n_playing <= ((W / 95.0).round() as usize).max(8), "音符数量不该超上限");
+    assert!(
+        n_playing <= super::max_notes(W),
+        "音符数量不该超上限：{n_playing}"
+    );
 
     for _ in 0..2400 {
         v.step(DT, W, H, false, true, None);

@@ -28,6 +28,160 @@ const TOL: f64 = 0.004;
 /// 落后超过这个秒数的帧直接丢弃，不做"快进补帧"。
 const LATE: f64 = 0.5;
 
+/// 用户手动调整的画面朝向，叠加在 ffmpeg 依据元数据自动摆正**之后**。
+///
+/// 语义（很要紧，改滤镜时别弄反）：`rot` 是把**屏幕上看到的那张画面**顺时针转过的
+/// 角度，`flip_*` 作用在转完之后、也就是屏幕上 —— 所以菜单里的"左右翻转"永远是
+/// 在眼前这张图上左右翻，而不是在原始坐标里翻。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Orientation {
+    /// 顺时针角度，只取 0 / 90 / 180 / 270
+    pub rot: u32,
+    pub flip_h: bool,
+    pub flip_v: bool,
+}
+
+impl Orientation {
+    pub const IDENTITY: Self = Self {
+        rot: 0,
+        flip_h: false,
+        flip_v: false,
+    };
+
+    pub fn is_identity(self) -> bool {
+        self == Self::IDENTITY
+    }
+
+    /// 归一化成 `(顺时针角度, 是否左右翻转)`。因为 `上下翻转 = 左右翻转 ∘ 旋转 180°`，
+    /// `(rot, flip_h, flip_v)` 有 16 种写法却只有 8 种效果（例如
+    /// `rot=180` 和 `左右翻转+上下翻转` 是同一件事）。比较"效果是否相同"时先归一。
+    pub fn canonical(self) -> (u32, bool) {
+        let rot = if self.flip_v {
+            (self.rot + 180) % 360
+        } else {
+            self.rot
+        };
+        (rot, self.flip_h ^ self.flip_v)
+    }
+
+    /// 两种写法是否画出同一张画面。
+    pub fn same_effect(self, other: Self) -> bool {
+        self.canonical() == other.canonical()
+    }
+
+    /// 旋转 90/270 时画面宽高互换。
+    pub fn dims(self, w: u32, h: u32) -> (u32, u32) {
+        if matches!(self.rot, 90 | 270) {
+            (h, w)
+        } else {
+            (w, h)
+        }
+    }
+
+    /// 接在 `scale=w:h` 后面的滤镜串（`w:h` 是**旋转前**的正立尺寸）。
+    ///
+    /// ffmpeg 的 `transpose=1` 是顺时针 90°，`transpose=2` 是逆时针 90°；
+    /// 180° 用两次 hflip/vflip 表示（两者可交换，顺序无所谓）。
+    pub fn filter_tail(self) -> String {
+        let mut s = String::new();
+        match self.rot {
+            90 => s.push_str(",transpose=1"),
+            180 => s.push_str(",hflip,vflip"),
+            270 => s.push_str(",transpose=2"),
+            _ => {}
+        }
+        if self.flip_h {
+            s.push_str(",hflip");
+        }
+        if self.flip_v {
+            s.push_str(",vflip");
+        }
+        s
+    }
+
+    /// 在当前看到的画面上再顺时针转 90°。
+    pub fn rotated_cw(self) -> Self {
+        Self {
+            rot: (self.rot + 90) % 360,
+            ..self
+        }
+    }
+
+    /// 在当前看到的画面上再逆时针转 90°。
+    pub fn rotated_ccw(self) -> Self {
+        Self {
+            rot: (self.rot + 270) % 360,
+            ..self
+        }
+    }
+
+    /// 在当前看到的画面上左右翻转。
+    ///
+    /// 屏幕空间的翻转要**先换算回原始坐标**：`水平翻转 ∘ 旋转 θ = 旋转 −θ ∘ 水平翻转`
+    /// （上下翻转同理）。少了这一步，转了 90° 之后再点"左右翻转"就会变成上下翻。
+    pub fn flipped_h(self) -> Self {
+        Self {
+            rot: (360 - self.rot) % 360,
+            flip_h: !self.flip_h,
+            ..self
+        }
+    }
+
+    /// 在当前看到的画面上上下翻转。
+    pub fn flipped_v(self) -> Self {
+        Self {
+            rot: (360 - self.rot) % 360,
+            flip_v: !self.flip_v,
+            ..self
+        }
+    }
+
+    /// 给 toast / 面板看的中文描述。
+    pub fn label(self) -> String {
+        if self.is_identity() {
+            return "原始".to_string();
+        }
+        let mut parts: Vec<&str> = Vec::new();
+        match self.rot {
+            90 => parts.push("顺时针 90°"),
+            180 => parts.push("旋转 180°"),
+            270 => parts.push("逆时针 90°"),
+            _ => {}
+        }
+        if self.flip_h {
+            parts.push("左右翻转");
+        }
+        if self.flip_v {
+            parts.push("上下翻转");
+        }
+        parts.join(" · ")
+    }
+
+    /// 把**输出**像素 (ox, oy) 映回**输入**像素 (x, y)。
+    ///
+    /// 静态图片走 CPU 变换时用它（视频那条路是 ffmpeg 滤镜自己转），
+    /// 两边的语义必须一致 —— `--selftest` 会拿真 ffmpeg 的产出来对这套映射。
+    pub fn map_back(self, ox: u32, oy: u32, w: u32, h: u32) -> (u32, u32) {
+        let (ow, oh) = self.dims(w, h);
+        // 先把"屏幕上的翻转"撤掉
+        let mut px = ox;
+        let mut py = oy;
+        if self.flip_h {
+            px = ow - 1 - px;
+        }
+        if self.flip_v {
+            py = oh - 1 - py;
+        }
+        // 再撤销旋转
+        match self.rot {
+            90 => (py, h - 1 - px),
+            180 => (w - 1 - px, h - 1 - py),
+            270 => (w - 1 - py, px),
+            _ => (px, py),
+        }
+    }
+}
+
 pub struct VideoFrame {
     pub pts: f64,
     pub image: Arc<RenderImage>,
@@ -35,8 +189,12 @@ pub struct VideoFrame {
 
 pub struct VideoTrack {
     path: PathBuf,
+    /// 送给 `scale` 的**旋转前**正立宽度（真正读多少字节由 `orient.dims` 决定）
     pub out_w: u32,
+    /// 同上，高度
     pub out_h: u32,
+    /// 用户调的画面朝向
+    pub orient: Orientation,
     fps: f64,
     rx: smol::channel::Receiver<VideoFrame>,
     cancel: Arc<Cancel>,
@@ -48,6 +206,11 @@ pub struct VideoTrack {
     current_pts: f64,
     /// 解码器已吐出的最后一帧时间点
     tail_pts: f64,
+    /// 刚重开解码、新画面还没到。这段时间**旧画面继续留在屏上**，
+    /// 别清成黑的（拖进度条时会一闪一闪），并且即便处于暂停也要允许挑帧。
+    awaiting: bool,
+    /// 这一轮重开一帧都没解出来（定位到末尾之外）。由 `advance` 记账。
+    empty_spawn: bool,
     /// 通道已关闭且本地队列排空 —— 不会再有新帧了
     drained: bool,
     /// 统计：一共丢了多少帧
@@ -67,6 +230,7 @@ impl VideoTrack {
             path: path.to_path_buf(),
             out_w,
             out_h,
+            orient: Orientation::IDENTITY,
             fps: if fps > 0.0 { fps } else { 25.0 },
             rx: smol::channel::bounded(1).1,
             cancel: Cancel::new(),
@@ -76,6 +240,8 @@ impl VideoTrack {
             current: None,
             current_pts: -1.0,
             tail_pts: 0.0,
+            awaiting: true,
+            empty_spawn: false,
             drained: false,
             dropped: 0,
         };
@@ -84,12 +250,18 @@ impl VideoTrack {
     }
 
     /// 换一段继续解（seek 用）。会先干掉上一个解码进程。
+    ///
+    /// **刻意不清 `current`**：seek 之后 ffmpeg 要重新起进程、定位、解出第一帧，
+    /// 这段时间里旧画面继续显示，屏幕才不会黑一下再亮一下。但 `current_pts` 必须
+    /// 归 -1 —— 往回拖时新帧的 pts 比旧的小，不归零会被 `set_current` 的单调性挡掉，
+    /// 画面就卡在旧位置不动了。
     fn spawn(&mut self, base: f64) -> Result<(), String> {
         self.kill();
         self.ahead.clear();
-        self.current = None;
         self.current_pts = -1.0;
         self.tail_pts = base;
+        self.awaiting = true;
+        self.empty_spawn = false;
         self.drained = false;
         self.dropped = 0;
 
@@ -102,16 +274,32 @@ impl VideoTrack {
 
         let path = self.path.clone();
         let (w, h, fps) = (self.out_w, self.out_h, self.fps);
+        let orient = self.orient;
+        // 真正读出来的像素尺寸是旋转**之后**的（90/270 时宽高互换）
+        let (rw, rh) = orient.dims(w, h);
 
-        let cmd = build_command(&path, w, h, fps, base)?;
+        let cmd = build_command(&path, w, h, fps, base, orient)?;
 
         self.handle = Some(std::thread::spawn(move || {
-            decode_loop(cmd, w, h, fps, base, tx, cancel, child_slot, ended);
+            decode_loop(cmd, rw, rh, fps, base, tx, cancel, child_slot, ended);
         }));
         Ok(())
     }
 
     pub fn seek(&mut self, pos: f64) -> Result<(), String> {
+        self.spawn(pos)
+    }
+
+    /// 换一个画面朝向：重开解码进程（跟 seek 同一条路径），`pos` 是当前播放位置，
+    /// 这样画面会立刻以新角度从当前位置重新解出来。
+    pub fn set_orientation(&mut self, orient: Orientation, pos: f64) -> Result<(), String> {
+        // 比"效果"而不是比结构：`rot=180` 与「左右翻转+上下翻转」是同一张画面，
+        // 没必要为它白重开一次解码（重开会让画面闪一下）。
+        if self.orient.same_effect(orient) {
+            self.orient = orient;
+            return Ok(());
+        }
+        self.orient = orient;
         self.spawn(pos)
     }
 
@@ -154,6 +342,13 @@ impl VideoTrack {
                 // 把它当结束会让播放随机停住 —— 这个坑踩过一次了。
                 Err(smol::channel::TryRecvError::Closed) => {
                     self.drained = true;
+                    // 这一轮重开一帧都没能上屏就把通道关了 —— 多半是定位到了
+                    // 文件末尾之外。记一笔，`ended` 靠它脱身，不然播放位置会一直
+                    // 往前走却永远没有画面。
+                    // `current_pts < 0` 就是"本轮没上过屏"的判据（spawn 会把它归 -1）。
+                    if self.awaiting && self.current_pts < 0.0 {
+                        self.empty_spawn = true;
+                    }
                     break;
                 }
                 Err(smol::channel::TryRecvError::Empty) => break,
@@ -167,7 +362,17 @@ impl VideoTrack {
         if f.pts >= self.current_pts {
             self.current = Some(f.image);
             self.current_pts = f.pts;
+            // 新画面已经上屏，不再是"等着"的状态
+            self.awaiting = false;
         }
+    }
+
+    /// 是否正在等 seek / 换角度之后的第一帧。
+    ///
+    /// 这一段时间里：① 旧画面留着别清；② 哪怕暂停也要继续挑帧（不然画面永远停在旧的）；
+    /// ③ 主循环得继续要帧，否则新画面出来了也没人画。
+    pub fn awaiting(&self) -> bool {
+        self.awaiting && !self.drained
     }
 
     /// 解码是否已经走完，且最后一帧也已经显示过。
@@ -175,10 +380,15 @@ impl VideoTrack {
     /// 必须要求 `current_pts >= 0`：起播瞬间通道还是空的，那时
     /// `drained && ahead.is_empty()` 也成立，不挡住的话会立刻被判"播完"。
     pub fn ended(&self, position: f64) -> bool {
-        self.current_pts >= 0.0
-            && self.drained
-            && self.ahead.is_empty()
-            && position >= self.current_pts - LATE
+        if !(self.drained && self.ahead.is_empty()) {
+            return false;
+        }
+        // 这一轮重开一帧都没解出来（`advance` 里记的账）——定位到末尾之外了，
+        // 没有 current_pts 可比，但也不能一直僵着，直接算走完。
+        if self.empty_spawn {
+            return true;
+        }
+        self.current_pts >= 0.0 && position >= self.current_pts - LATE
     }
 
 
@@ -201,7 +411,14 @@ impl Drop for VideoTrack {
     }
 }
 
-fn build_command(path: &Path, w: u32, h: u32, fps: f64, base: f64) -> Result<Command, String> {
+fn build_command(
+    path: &Path,
+    w: u32,
+    h: u32,
+    fps: f64,
+    base: f64,
+    orient: Orientation,
+) -> Result<Command, String> {
     let mut cmd = ffmpeg::base_command()?;
     if base > 0.0 {
         // `-ss` 放在 `-i` 之前 = 源内定位，秒开；输出时间戳会归零，帧序号从 0 重算。
@@ -214,11 +431,13 @@ fn build_command(path: &Path, w: u32, h: u32, fps: f64, base: f64) -> Result<Com
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .is_some_and(|e| e == "gif" || e == "webp");
-    let filter = if steady {
+    let head = if steady {
         format!("fps={fps:.6},scale={w}:{h}:flags=bicubic")
     } else {
         format!("scale={w}:{h}:flags=bicubic")
     };
+    // 用户的旋转/翻转接在缩放后面 —— 先缩好再转，输出尺寸才是确定的一块。
+    let filter = format!("{head}{}", orient.filter_tail());
 
     cmd.arg("-i")
         .arg(path)
@@ -378,5 +597,164 @@ mod tests {
         // 宽高比保持
         let (w, h) = fit_size(1000, 500, 0, 400, 400);
         assert_eq!((w, h), (400, 200));
+    }
+
+    // ── 画面朝向 ────────────────────────────────────────────────────────
+
+    /// 只有 90/270 会换宽高。
+    #[test]
+    fn orientation_swaps_dims_only_for_quarter_turns() {
+        assert_eq!(Orientation::IDENTITY.dims(4, 2), (4, 2));
+        assert_eq!(Orientation { rot: 180, ..Default::default() }.dims(4, 2), (4, 2));
+        assert_eq!(Orientation { rot: 90, ..Default::default() }.dims(4, 2), (2, 4));
+        assert_eq!(Orientation { rot: 270, ..Default::default() }.dims(4, 2), (2, 4));
+    }
+
+    /// 滤镜串：转在前、翻在后（翻转作用在屏幕坐标里）。
+    #[test]
+    fn orientation_filter_chain() {
+        let o = Orientation::IDENTITY;
+        assert_eq!(o.filter_tail(), "");
+        assert_eq!(Orientation { rot: 90, ..o }.filter_tail(), ",transpose=1");
+        assert_eq!(Orientation { rot: 270, ..o }.filter_tail(), ",transpose=2");
+        assert_eq!(Orientation { rot: 180, ..o }.filter_tail(), ",hflip,vflip");
+        assert_eq!(
+            Orientation { rot: 90, flip_h: true, ..o }.filter_tail(),
+            ",transpose=1,hflip"
+        );
+        assert_eq!(
+            Orientation { rot: 90, flip_h: true, flip_v: true }.filter_tail(),
+            ",transpose=1,hflip,vflip"
+        );
+    }
+
+    /// 四步转回原位；翻两次回到原位。
+    #[test]
+    fn orientation_group_laws() {
+        let o = Orientation::IDENTITY;
+        assert!(o.rotated_cw().rotated_cw().rotated_cw().rotated_cw().is_identity());
+        assert!(o.rotated_ccw().rotated_ccw().rotated_ccw().rotated_ccw().is_identity());
+        assert!(o.flipped_h().flipped_h().is_identity());
+        assert!(o.flipped_v().flipped_v().is_identity());
+        assert_eq!(o.rotated_cw().rotated_ccw(), o);
+        assert_eq!(o.rotated_ccw().rot, 270);
+        assert_eq!(o.rotated_cw().rot, 90);
+    }
+
+    /// **翻转作用在屏幕上**：转过 90° 之后再点"左右翻转"，
+    /// 必须还是左右翻（rot 要换算成 −θ，否则就变成上下翻了）。
+    #[test]
+    fn flips_stay_in_screen_space_after_rotation() {
+        let r90 = Orientation { rot: 90, ..Default::default() };
+        assert_eq!(
+            r90.flipped_h(),
+            Orientation { rot: 270, flip_h: true, flip_v: false }
+        );
+        assert_eq!(
+            r90.flipped_v(),
+            Orientation { rot: 270, flip_h: false, flip_v: true }
+        );
+        // 180° 自身对称，翻转后角度不变
+        let r180 = Orientation { rot: 180, ..Default::default() };
+        assert_eq!(r180.flipped_h().rot, 180);
+        // 转 180° 等价于左右翻转 + 上下翻转（这俩可交换）—— 写法不同、效果相同
+        assert!(
+            r180.same_effect(Orientation::IDENTITY.flipped_h().flipped_v()),
+            "rot=180 应当与「左右翻转+上下翻转」等价"
+        );
+        assert!(!r180.is_identity());
+    }
+
+    /// 归一化 / 等价判定本身要靠谱：8 种效果、每种都分得开。
+    #[test]
+    fn orientation_has_eight_distinct_effects() {
+        let o = Orientation::IDENTITY;
+        let all = [
+            o,
+            o.rotated_cw(),
+            o.rotated_cw().rotated_cw(),
+            o.rotated_ccw(),
+            o.flipped_h(),
+            o.flipped_v(),
+            o.rotated_cw().flipped_h(),
+            o.rotated_cw().flipped_v(),
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert!(
+                    !all[i].same_effect(all[j]),
+                    "{:?} 与 {:?} 应当是不同的朝向",
+                    all[i],
+                    all[j]
+                );
+            }
+        }
+        // 上下翻转 = 左右翻转 + 旋转 180°
+        assert!(o.flipped_v().same_effect(o.rotated_cw().rotated_cw().flipped_h()));
+    }
+
+    /// `map_back` 必须是**双射**：输出里每个像素都能对回一个唯一的输入像素。
+    #[test]
+    fn orientation_map_is_a_bijection() {
+        let (w, h) = (4u32, 3u32);
+        let all = [
+            Orientation::IDENTITY,
+            Orientation { rot: 90, ..Default::default() },
+            Orientation { rot: 180, ..Default::default() },
+            Orientation { rot: 270, ..Default::default() },
+            Orientation { flip_h: true, ..Default::default() },
+            Orientation { flip_v: true, ..Default::default() },
+            Orientation { rot: 90, flip_h: true, flip_v: true },
+            Orientation { rot: 270, flip_h: true, flip_v: false },
+        ];
+        for o in all {
+            let (ow, oh) = o.dims(w, h);
+            let mut seen = vec![false; (w * h) as usize];
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    let (x, y) = o.map_back(ox, oy, w, h);
+                    assert!(x < w && y < h, "{o:?} 映出界: ({ox},{oy}) -> ({x},{y})");
+                    let i = (y * w + x) as usize;
+                    assert!(!seen[i], "{o:?} 不是双射：({x},{y}) 被映了两次");
+                    seen[i] = true;
+                }
+            }
+            assert!(seen.iter().all(|s| *s), "{o:?} 漏掉了像素");
+        }
+    }
+
+    /// 角点手工核对（和 ffmpeg 的 transpose 语义对齐，`--selftest` 也会真跑一遍）。
+    #[test]
+    fn orientation_corners() {
+        let (w, h) = (4u32, 2u32);
+        // 顺时针 90°：原图左上角跑到输出的右上角
+        let cw = Orientation { rot: 90, ..Default::default() };
+        assert_eq!(cw.dims(w, h), (2, 4));
+        assert_eq!(cw.map_back(1, 0, w, h), (0, 0));
+        // 逆时针 90°：左上角跑到输出的左下角
+        let ccw = Orientation { rot: 270, ..Default::default() };
+        assert_eq!(ccw.map_back(0, 3, w, h), (0, 0));
+        // 左右 / 上下翻转
+        let fh = Orientation { flip_h: true, ..Default::default() };
+        assert_eq!(fh.map_back(3, 0, w, h), (0, 0));
+        let fv = Orientation { flip_v: true, ..Default::default() };
+        assert_eq!(fv.map_back(0, 1, w, h), (0, 0));
+        // 顺时针 90° + 左右翻转（屏幕空间）：左上角落在输出左上角
+        let mix = Orientation { rot: 90, flip_h: true, flip_v: false };
+        assert_eq!(mix.map_back(0, 0, w, h), (0, 0));
+    }
+
+    /// 中文描述（toast / 面板标题用）。
+    #[test]
+    fn orientation_labels() {
+        assert_eq!(Orientation::IDENTITY.label(), "原始");
+        assert_eq!(
+            Orientation { rot: 90, flip_h: true, ..Default::default() }.label(),
+            "顺时针 90° · 左右翻转"
+        );
+        assert_eq!(
+            Orientation { rot: 180, ..Default::default() }.label(),
+            "旋转 180°"
+        );
     }
 }

@@ -5,6 +5,10 @@
 
 <p align="center">基于 <b>Rust + GPUI</b> 的桌面媒体播放器，ffmpeg 解码直出纹理上屏，不产生任何转码缓存。</p>
 
+<p align="center">
+  <img src="docs/screenshot.jpg" alt="iPlayer 界面截图" width="760">
+</p>
+
 打开本地文件就能看、能听：视频与音频交给 ffmpeg 解码，解出的 BGRA 裸帧直接当纹理上屏，声音走 cpal；
 图片按格式分流给 `image`、resvg 或 ffmpeg 兜底。除播放之外还带一套导出工具箱（截图 / 提取音频 / 转 GIF），
 以及文件列表、倍速、循环、画面适应、全屏、置顶这些播放器该有的东西。

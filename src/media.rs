@@ -24,6 +24,91 @@ pub const IMAGE_EXTS: &[&str] = &[
     "psd",
 ];
 
+/// 我们对外声明的"能打开什么"。**只有这一份**，三个地方都从它派生：
+/// `kind_of`（扫描时判类型）、文件对话框的过滤器、以及打进 `Info.plist` 的
+/// `CFBundleDocumentTypes`（`iplayer --doc-types` 吐给打包脚本）。
+///
+/// 为什么非要扩展名而不仅是 UTI：`rmvb`、`ape`、`ts`、`flv` 这类在 macOS 上
+/// **根本没有对应的 UTI**，只声明 `public.movie` / `public.audio` 的话，
+/// 它们在访达的"打开方式"里永远看不到 iPlayer。
+pub struct DocType {
+    /// 给系统看的中文名，会出现在"打开方式"列表的说明里
+    pub name: &'static str,
+    /// 内容类型（UTI）。设默认打开方式时也是按这几个去设。
+    pub utis: &'static [&'static str],
+    pub exts: &'static [&'static str],
+}
+
+pub const DOC_TYPES: &[DocType] = &[
+    DocType {
+        name: "视频",
+        utis: &["public.movie", "public.video"],
+        exts: VIDEO_EXTS,
+    },
+    DocType {
+        name: "音频",
+        utis: &["public.audio"],
+        exts: AUDIO_EXTS,
+    },
+    DocType {
+        name: "图片",
+        utis: &["public.image", "public.svg-image"],
+        exts: IMAGE_EXTS,
+    },
+];
+
+/// 所有支持的扩展名（文件对话框的过滤器用）。
+pub fn all_exts() -> Vec<&'static str> {
+    DOC_TYPES
+        .iter()
+        .flat_map(|d| d.exts.iter().copied())
+        .collect()
+}
+
+/// 所有声明过的内容类型，去重（"设为默认播放器"逐个去设）。
+pub fn all_utis() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for d in DOC_TYPES {
+        for u in d.utis {
+            if !out.contains(u) {
+                out.push(u);
+            }
+        }
+    }
+    out
+}
+
+/// `Info.plist` 里 `CFBundleDocumentTypes` 那一整段 XML。
+///
+/// 打包脚本直接把 `iplayer --doc-types` 的输出嵌进 plist —— 与其在 shell 里
+/// 再抄一遍几十个扩展名（抄漏一个那个格式就永远关联不上），不如让代码当唯一来源。
+pub fn doc_types_plist() -> String {
+    let mut out = String::from("<key>CFBundleDocumentTypes</key>\n    <array>\n");
+    for d in DOC_TYPES {
+        out.push_str("        <dict>\n");
+        out.push_str(&format!(
+            "            <key>CFBundleTypeName</key><string>{}</string>\n",
+            d.name
+        ));
+        // Viewer：只读打开。LSHandlerRank=Alternate：能被选中、但不抢系统的默认值
+        // （用户想设默认就用应用里的「设为默认播放器」，或访达里"全部更改"）。
+        out.push_str("            <key>CFBundleTypeRole</key><string>Viewer</string>\n");
+        out.push_str("            <key>LSHandlerRank</key><string>Alternate</string>\n");
+        out.push_str("            <key>LSItemContentTypes</key>\n            <array>\n");
+        for u in d.utis {
+            out.push_str(&format!("                <string>{u}</string>\n"));
+        }
+        out.push_str("            </array>\n");
+        out.push_str("            <key>CFBundleTypeExtensions</key>\n            <array>\n");
+        for e in d.exts {
+            out.push_str(&format!("                <string>{e}</string>\n"));
+        }
+        out.push_str("            </array>\n        </dict>\n");
+    }
+    out.push_str("    </array>");
+    out
+}
+
 #[derive(Serialize, Clone)]
 pub struct MediaFile {
     pub name: String,

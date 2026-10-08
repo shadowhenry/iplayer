@@ -27,6 +27,11 @@ pub fn band_count_for_width(w: f32) -> usize {
     ((w / 15.0).round() as usize).clamp(20, 72)
 }
 
+/// 同屏音符上限：按舞台宽给量，至少 12 个。
+pub fn max_notes(w: f32) -> usize {
+    ((w / 70.0).round() as usize).max(12)
+}
+
 struct Note {
     glyph: char,
     /// 横向占比 0..1（相对舞台宽）
@@ -201,9 +206,10 @@ impl Viz {
         if self.w <= 1.0 {
             return;
         }
-        let max = ((self.w / 95.0).round() as usize).max(8);
+        let max = max_notes(self.w);
         if self.playing {
-            self.spawn_acc += dt * (1.1 + self.rand() * 0.9);
+            // 播放时更密一些（约 2.2–3.6 个/秒），音符从底部往上飘
+            self.spawn_acc += dt * (2.2 + self.rand() * 1.4);
             while self.spawn_acc >= 1.0 {
                 self.spawn_acc -= 1.0;
                 if self.notes.len() >= max {
@@ -224,19 +230,21 @@ impl Viz {
 
     fn new_note(&mut self, seeded: bool) -> Note {
         let g = GLYPHS[(self.rand() * GLYPHS.len() as f32) as usize % GLYPHS.len()];
-        let size = (self.h * (0.05 + self.rand() * 0.17)).clamp(15.0, self.h * 0.22);
+        // 尺寸随机跨度拉大：小到 12px、大到舞台高的 20%
+        let size = (self.h * (0.04 + self.rand() * 0.16)).clamp(12.0, self.h * 0.20);
         let h = self.h.max(1.0);
         Note {
             glyph: g,
-            x: 0.05 + self.rand() * 0.87,
+            x: 0.06 + self.rand() * 0.88,
             y: if seeded {
                 0.1 + self.rand() * 0.9
             } else {
+                // 从下缘之下起步，往上飘进画面
                 1.0 + size * 0.6 / h
             },
             size,
-            alpha: 0.1 + self.rand() * 0.2,
-            vy: -(0.035 + self.rand() * 0.08),
+            alpha: 0.13 + self.rand() * 0.24,
+            vy: -(0.045 + self.rand() * 0.09),
             wob: 5.0 + self.rand() * 22.0,
             wob_speed: 0.4 + self.rand() * 0.9,
             phase: self.rand() * std::f32::consts::TAU,
@@ -305,16 +313,19 @@ impl Viz {
         if n > 0 && self.w > 1.0 && self.h > 1.0 {
             let gap = (self.w * 0.0045).max(2.0);
             let bw = ((self.w * 0.95 - gap * (n - 1) as f32) / n as f32).max(2.0);
-            let max_h = self.h * 0.34;
-            let r = (bw / 2.0).min(4.0);
-            let min_h = bw * 0.55;
+            // 柱身只占自己那一格约 46% 宽，柱子更细
+            let inset = (bw * 0.27).max(1.0);
+            let r = (bw * 0.24).min(3.0);
+            let max_h = self.h * 0.52;
+            let min_h = bw * 0.5;
 
             let mut bars = div()
                 .absolute()
                 .left(relative(0.025))
                 .right(relative(0.025))
+                // 离底缘的距离（用户要求缩短一倍：0.14 → 0.07）
                 .bottom(relative(0.07))
-                .h(relative(0.34))
+                .h(relative(0.52))
                 .flex()
                 .items_end()
                 .gap(px(gap));
@@ -326,8 +337,8 @@ impl Viz {
                 // 柔光晕（旧版先铺一层 alpha 0.07 的加宽柱）
                 let halo = div()
                     .absolute()
-                    .left(px(-2.0))
-                    .right(px(-2.0))
+                    .left(px(inset - 2.0))
+                    .right(px(inset - 2.0))
                     .bottom(px(0.0))
                     .h(relative(h_frac))
                     .rounded_t(px(r + 2.0))
@@ -336,8 +347,8 @@ impl Viz {
                 // 折中为 0.82 实心（视觉上仍明显压得住 0.5 的峰值帽）
                 let bar = div()
                     .absolute()
-                    .left(px(0.0))
-                    .right(px(0.0))
+                    .left(px(inset))
+                    .right(px(inset))
                     .bottom(px(0.0))
                     .h(relative(h_frac))
                     .rounded_t(px(r))
@@ -347,8 +358,8 @@ impl Viz {
                 let cap_frac = ((min_h / max_h).max(peak) + 2.5 / max_h).min(1.0);
                 let cap = div()
                     .absolute()
-                    .left(px(0.0))
-                    .right(px(0.0))
+                    .left(px(inset))
+                    .right(px(inset))
                     .bottom(relative(cap_frac))
                     .h(px(2.5))
                     .rounded(px(1.25))

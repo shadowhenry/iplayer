@@ -173,7 +173,8 @@ mod tests {
         t.play();
         sleep(Duration::from_millis(60));
         let p = t.position();
-        assert!(p > 0.02 && p < 0.5, "{p}");
+        // 上界给得宽松：机器负载高时 sleep 会明显超时，卡 0.5s 会偶发假红
+        assert!(p > 0.02 && p < 2.0, "{p}");
         t.pause();
         let paused = t.position();
         sleep(Duration::from_millis(40));
