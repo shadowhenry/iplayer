@@ -1,5 +1,5 @@
-//! 窗口的平台级开关：**全屏** / **窗口置顶** / **接收系统派发的"打开文件"** /
-//! **设为默认播放器**。
+//! 窗口的平台级开关：**全屏** / **窗口置顶** / **最小化 / 最大化** /
+//! **接收系统派发的"打开文件"** / **设为默认播放器**。
 //!
 //! GPUI 把前两件事藏在 `PlatformWindow` 里（`toggle_fullscreen` 有，但那个
 //! trait 对象是 crate 私有的，`Window` 没有透出来），所以这里顺着
@@ -90,6 +90,25 @@ mod imp {
         true
     }
 
+    /// 缩到 Dock（右上角那颗「最小化」）。
+    pub fn minimize_window(window: &Window) -> bool {
+        let Some(win) = ns_window(window) else {
+            return false;
+        };
+        win.miniaturize(None);
+        true
+    }
+
+    /// 「最大化」= AppKit 的 zoom：在"用户摆的尺寸"和"屏幕可用尺寸"之间切换，
+    /// 再点一次就还原 —— 和绿色交通灯按钮是同一个动作。
+    pub fn zoom_window(window: &Window) -> bool {
+        let Some(win) = ns_window(window) else {
+            return false;
+        };
+        win.zoom(None);
+        true
+    }
+
     /// 把窗口**藏起来**而不是关掉（红绿灯关闭走这条）。
     ///
     /// 窗口销毁了 App 状态就没了，之后 Dock 点图标也无法"回到主界面"——
@@ -109,6 +128,10 @@ mod imp {
         let Some(win) = ns_window(window) else {
             return false;
         };
+        // 最小化到 Dock 的窗口 orderFront 是唤不回来的，得先 deminiaturize
+        if win.isMiniaturized() {
+            win.deminiaturize(None);
+        }
         win.orderFront(None);
         win.makeKeyAndOrderFront(None);
         // 从其它应用切回来时也要能抢到前台（activateIgnoringOtherApps 已废弃）
@@ -369,6 +392,14 @@ mod imp {
         false
     }
 
+    pub fn minimize_window(_window: &Window) -> bool {
+        false
+    }
+
+    pub fn zoom_window(_window: &Window) -> bool {
+        false
+    }
+
     /// 别的平台没有 Apple Event 那套"打开文档"，命令行参数就是全部入口。
     pub fn install_open_docs() {}
 
@@ -401,6 +432,6 @@ mod imp {
 
 pub use imp::{
     async_sheet_available, default_handler_bundle_id, hide_window, install_open_docs,
-    is_fullscreen, own_bundle_id, set_always_on_top, set_default_role_handler, show_window,
-    take_open_doc, toggle_fullscreen,
+    is_fullscreen, minimize_window, own_bundle_id, set_always_on_top, set_default_role_handler,
+    show_window, take_open_doc, toggle_fullscreen, zoom_window,
 };

@@ -274,7 +274,8 @@ impl Viz {
         !self.settled()
     }
 
-    /// 绘制树：音符层在下、频谱层在上；居中的曲名/编码信息由调用方叠在顶上。
+    /// 绘制树：音符层在下、频谱层在上。中央那行曲名由调用方
+    /// （`app::App::now_playing`）另外叠在最上面，本层不掺和。
     /// `ink` 是墨水色（黑白规范下的 pal.text()）。
     pub fn render(&self, ink: Hsla) -> AnyElement {
         let mut overlay = div().absolute().size_full().overflow_hidden();

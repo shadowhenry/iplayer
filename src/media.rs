@@ -403,12 +403,22 @@ struct StreamTags {
     rotate: String,
 }
 
+/// 容器级标签（MP3 的 ID3、FLAC/OGG 的 Vorbis comment 都出现在这里）。
+#[derive(serde::Deserialize, Default)]
+struct FormatTags {
+    /// 曲名。没打过标签就是空串 —— 调用方自己退回文件名。
+    #[serde(default)]
+    title: String,
+}
+
 #[derive(serde::Deserialize)]
 struct ProbeFormat {
     #[serde(default)]
     format_long_name: String,
     #[serde(default)]
     duration: String,
+    #[serde(default)]
+    tags: FormatTags,
     #[serde(default)]
     bit_rate: String,
     #[serde(default)]
@@ -428,6 +438,9 @@ struct ProbeRoot {
 pub struct MediaInfo {
     pub path: String,
     pub ext: String,
+    /// 容器标签里的曲名（ID3 `title` 等）。没标签就是空串，
+    /// 音频舞台显示时再退回文件名 —— 见 `app::song_title`。
+    pub title: String,
     /// one of: `video` | `audio`
     pub kind: String,
     pub duration: f64,
@@ -519,6 +532,9 @@ pub fn probe(path: &Path) -> Result<MediaInfo, String> {
     Ok(MediaInfo {
         path: path.to_string_lossy().to_string(),
         ext,
+        title: fmt
+            .map(|f| f.tags.title.trim().to_string())
+            .unwrap_or_default(),
         kind: if has_video { "video" } else { "audio" }.to_string(),
         duration,
         width: video.map(|v| v.width).unwrap_or(0),

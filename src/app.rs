@@ -26,6 +26,7 @@ use crate::icons;
 use crate::media::{self, MediaFile, MediaInfo};
 use crate::native;
 use crate::player::{Orientation, Player};
+use crate::subtitle::{self, Subtitles};
 use crate::theme::{self, Palette};
 use crate::viz;
 
@@ -95,6 +96,11 @@ const TOAST_TTL: Duration = Duration::from_secs(3);
 // 只改图标，方框（36 / 播放键 44）不动 —— 点击热区保持不变，只是图形更收敛。
 const PLAY_ICON: f32 = 28.6 * 2.0 / 3.0;
 
+/// 字幕的基准字号与三档缩放（面板里的「小 / 中 / 大」）。
+const SUB_FONT: f32 = 17.0;
+const SUB_SCALES: [f32; 3] = [0.85, 1.0, 1.25];
+const SUB_SIZE_LABELS: [&str; 3] = ["小", "中", "大"];
+
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Filter {
@@ -162,10 +168,23 @@ impl LoopMode {
 /// 舞台上正在显示的东西。
 enum Stage {
     Empty,
-    /// 纯音频页（只放均衡器可视化，不显示曲名/规格）
+    /// 纯音频页：均衡器可视化铺满播放区，中间叠一行曲名
     Audio,
     /// 静态图片
     Image(Arc<RenderImage>),
+}
+
+/// 音频舞台上要显示的曲名：容器标签里的 `title` 优先，没有就用文件名（去掉扩展名）。
+/// 两边都拿不到（比如文件已经不在列表里）就返回 `None`，舞台上不叠这一层。
+fn song_title(tag: Option<&str>, path: Option<&str>) -> Option<String> {
+    if let Some(t) = tag.map(str::trim).filter(|t| !t.is_empty()) {
+        return Some(t.to_string());
+    }
+    let name = std::path::Path::new(path?)
+        .file_stem()?
+        .to_string_lossy()
+        .to_string();
+    (!name.trim().is_empty()).then_some(name)
 }
 
 /// 把 `catch_unwind` 抓到的 panic 载荷变成一句能显示的话。
@@ -239,6 +258,18 @@ pub struct App {
     export: Option<Export>,
     /// 已经弹出、正等用户选路径的保存面板。**非阻塞**，靠帧循环轮询。
     dialog: Option<PendingSave>,
+
+    // — 字幕 —
+    /// 当前载入的字幕（换文件时清掉，再找同名 sidecar）
+    subs: Option<Subtitles>,
+    /// 字幕是否显示（用户要求：可以隐藏字幕）。换字幕时重新打开。
+    sub_visible: bool,
+    /// 字幕面板是否展开
+    sub_panel: bool,
+    /// 字号档位，索引进 [`SUB_SCALES`]
+    sub_size: usize,
+    /// 已经弹出、正等用户选字幕文件的非阻塞面板
+    sub_dialog: Option<PendingOpen>,
     toast: Option<(String, Instant)>,
     warmup: u8,
     /// 空舞台中央的品牌 logo（编译期嵌进二进制，打包不用带 assets/）
@@ -257,13 +288,33 @@ pub struct App {
 /// dispatch source —— 模态期间照样触发，于是帧回调重入 GPUI 直接 panic；
 /// 偏偏这个回调站在 `extern "C"` 边界上没法 unwind，进程当场 abort
 /// （崩溃日志里只有一句 "panic in a function that cannot unwind"）。
+/// rfd 非阻塞面板返回的 future（`save_file` / `pick_file` 是同一个类型）。
+type DialogFuture = Pin<Box<dyn Future<Output = Option<rfd::FileHandle>>>>;
+
 struct PendingSave {
     kind: export::Kind,
     src: PathBuf,
     /// 弹面板那一刻冻结的导出起点与总时长
     pos: f64,
     dur: f64,
-    fut: Pin<Box<dyn Future<Output = Option<rfd::FileHandle>>>>,
+    fut: DialogFuture,
+}
+
+/// 已经弹出、正等用户**挑一个文件**的打开面板（导入字幕用）。
+/// 和 [`PendingSave`] 同一套理由：绝不能碰同步的 `pick_file()`。
+struct PendingOpen {
+    fut: DialogFuture,
+}
+
+impl PendingOpen {
+    /// `None` = 面板还开着；`Some(Some(p))` = 选了 `p`；`Some(None)` = 用户取消。
+    fn poll(&mut self) -> Option<Option<PathBuf>> {
+        let mut cx = TaskContext::from_waker(std::task::Waker::noop());
+        match self.fut.as_mut().poll(&mut cx) {
+            Poll::Pending => None,
+            Poll::Ready(picked) => Some(picked.map(|h| PathBuf::from(h.path()))),
+        }
+    }
 }
 
 impl PendingSave {
@@ -398,6 +449,11 @@ impl App {
             export_panel: false,
             export: None,
             dialog: None,
+            subs: None,
+            sub_visible: true,
+            sub_panel: false,
+            sub_size: 1,
+            sub_dialog: None,
             toast: None,
             warmup: 0,
             logo: load_logo(),
@@ -515,6 +571,9 @@ impl App {
         self.player = None;
         self.info = None;
         self.still_base = None;
+        // 字幕是"针对这一个文件"的：换文件 / 停止时先清掉，
+        // `open_file` 随后会去找同名 sidecar（`movie.mp4` → `movie.srt`）。
+        self.subs = None;
         // 换文件 / 停止：均衡器的柱子和音符一并清场
         self.viz.reset();
         self.viz_last = None;
@@ -585,6 +644,7 @@ impl App {
                 } else {
                     Stage::Audio
                 };
+                self.auto_load_sidecar(&path, cx);
                 // 画面的摆放统一在 render_stage 里写死为 Contain：
                 // 播放区尺寸不随视频变，画面按原始比例自适应缩放进去，
                 // 富裕空间留黑边 —— 绝不再拉伸变形（用户明确要求）。
@@ -743,6 +803,23 @@ impl App {
         cx.notify();
     }
 
+    /// 缩到 Dock（右上角那颗「最小化」）。点 Dock 图标会由
+    /// `show_window` 里的 deminiaturize 唤回来。
+    fn minimize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !native::minimize_window(window) {
+            self.toast("当前平台不支持最小化", cx);
+        }
+        cx.notify();
+    }
+
+    /// 「最大化」= AppKit 的 zoom（与绿色交通灯同动作，再点一次还原）。
+    fn maximize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !native::zoom_window(window) {
+            self.toast("当前平台不支持最大化", cx);
+        }
+        cx.notify();
+    }
+
     // ── 画面角度 ────────────────────────────────────────────────────────
 
     /// 舞台上此刻有没有"画面"可以调 —— 视频/动图靠播放器，静态图片靠 `still_base`。
@@ -753,8 +830,9 @@ impl App {
     fn toggle_orient_panel(&mut self, cx: &mut Context<Self>) {
         self.orient_panel = !self.orient_panel;
         if self.orient_panel {
-            // 两个浮层别叠在一起
+            // 浮层都占右下角，别叠在一起
             self.export_panel = false;
+            self.sub_panel = false;
         }
         cx.notify();
     }
@@ -796,6 +874,7 @@ impl App {
         self.export_panel = !self.export_panel;
         if self.export_panel {
             self.orient_panel = false;
+            self.sub_panel = false;
         }
         cx.notify();
     }
@@ -939,6 +1018,125 @@ impl App {
         self.toast("正在取消…", cx);
     }
 
+    // ── 字幕 ────────────────────────────────────────────────────────────
+
+    /// 打开媒体文件时顺手找同名 sidecar 字幕（`movie.mp4` → `movie.srt`）。
+    /// 播放器都这么干，省得每次手动导入一遍；找到了就明说一句，别偷偷加东西。
+    fn auto_load_sidecar(&mut self, media: &PathBuf, cx: &mut Context<Self>) {
+        let Some(path) = subtitle::sidecar(media) else {
+            return;
+        };
+        match subtitle::load(&path) {
+            Ok(s) => {
+                let (n, name) = (s.len(), s.name.clone());
+                self.subs = Some(s);
+                self.sub_visible = true;
+                self.toast(format!("已自动载入同名字幕 {name}（{n} 条）"), cx);
+            }
+            Err(e) => self.toast(format!("同名字幕载入失败：{e}"), cx),
+        }
+    }
+
+    fn toggle_sub_panel(&mut self, cx: &mut Context<Self>) {
+        self.sub_panel = !self.sub_panel;
+        if self.sub_panel {
+            // 三个面板都占舞台右下角，一次只开一个
+            self.export_panel = false;
+            self.orient_panel = false;
+        }
+        cx.notify();
+    }
+
+    /// 面板里点「导入字幕…」：当场挂上**非阻塞**的打开面板。
+    ///
+    /// 与导出同一套理由（见 [`PendingSave`]）：同步的 `pick_file()` 内部是
+    /// `runModal`，会把主队列上的帧源重入 → panic → abort。所以先自查环境、
+    /// 再 `catch_unwind` 兜底，无论如何点击的结果只能是"弹面板"或"给提示"。
+    fn request_import_subtitle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sub_dialog.is_some() {
+            self.toast("先处理完弹出的字幕面板", cx);
+            return;
+        }
+        if !crate::native::async_sheet_available(window) {
+            self.toast("当前环境打不开非阻塞文件面板，这次先不导入了", cx);
+            return;
+        }
+        // 默认落在当前媒体所在目录，找同名字幕最省事
+        let start = self
+            .active_path
+            .as_deref()
+            .map(PathBuf::from)
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .filter(|d| d.is_dir());
+        let parent = &*window;
+        let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut dlg = rfd::AsyncFileDialog::new().add_filter("字幕文件", subtitle::EXTENSIONS);
+            if let Some(dir) = &start {
+                dlg = dlg.set_directory(dir);
+            }
+            // 一定要显式给父窗口：rfd 找不到窗口同样会退回同步 `runModal`
+            dlg.set_parent(parent).pick_file()
+        }));
+        let fut = match opened {
+            Ok(fut) => fut,
+            Err(payload) => {
+                let why = panic_reason(&payload);
+                self.toast(format!("打不开文件面板：{why}"), cx);
+                return;
+            }
+        };
+        self.sub_dialog = Some(PendingOpen { fut: Box::pin(fut) });
+        // 面板不阻塞，结果靠帧循环每帧轮询（同导出面板）
+        cx.notify();
+    }
+
+    /// 选好了字幕文件：解析进内存，并顺手打开显示。
+    fn load_subtitle(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        match subtitle::load(&path) {
+            Ok(s) => {
+                let (n, name, fmt) = (s.len(), s.name.clone(), s.format.label());
+                self.subs = Some(s);
+                self.sub_visible = true;
+                self.toast(format!("已载入字幕 {name}（{fmt} · {n} 条）"), cx);
+            }
+            Err(e) => self.toast(e, cx),
+        }
+    }
+
+    /// 显示 / 隐藏字幕（面板里那一行，快捷键 `S` 也走这里）。
+    fn toggle_subtitles(&mut self, cx: &mut Context<Self>) {
+        if self.subs.is_none() {
+            self.toast("还没有字幕，控制条「字幕」按钮里可以导入", cx);
+            return;
+        }
+        self.sub_visible = !self.sub_visible;
+        let msg = if self.sub_visible {
+            "字幕：显示"
+        } else {
+            "字幕：隐藏"
+        };
+        self.toast(msg, cx);
+    }
+
+    fn remove_subtitle(&mut self, cx: &mut Context<Self>) {
+        if self.subs.take().is_none() {
+            self.toast("当前没有字幕", cx);
+            return;
+        }
+        self.toast("已移除字幕", cx);
+    }
+
+    /// 字号在小 → 中 → 大之间转圈。
+    fn cycle_sub_size(&mut self, cx: &mut Context<Self>) {
+        self.sub_size = (self.sub_size + 1) % SUB_SCALES.len();
+        let label = SUB_SIZE_LABELS[self.sub_size];
+        self.toast(format!("字幕大小：{label}"), cx);
+    }
+
+    fn sub_scale(&self) -> f32 {
+        SUB_SCALES[self.sub_size.min(SUB_SCALES.len() - 1)]
+    }
+
     /// 把 iPlayer 设成媒体文件的默认打开方式（访达"全部更改"背后的那个 API）。
     fn set_default_player(&mut self, cx: &mut Context<Self>) {
         match native::set_default_role_handler(&media::all_utis()) {
@@ -965,7 +1163,7 @@ impl App {
         };
         self.is_default_player = current == own;
         if !self.is_default_player {
-            self.toast("点右上角的链条图标，可以把 iPlayer 设为默认播放器", cx);
+            self.toast("按 ⌘D 可以把 iPlayer 设为默认播放器", cx);
         }
     }
 
@@ -1015,6 +1213,18 @@ impl App {
                     self.begin_export(d.kind, d.src, d.pos, d.dur, dest, window, cx);
                 }
                 Some(None) => cx.notify(), // 用户点了取消
+            }
+        }
+
+        // 字幕的打开面板同理：每帧轮询一次，选完之前得一直要帧
+        if let Some(mut d) = self.sub_dialog.take() {
+            match d.poll() {
+                None => {
+                    self.sub_dialog = Some(d);
+                    window.request_animation_frame();
+                }
+                Some(Some(path)) => self.load_subtitle(path, cx),
+                Some(None) => cx.notify(),
             }
         }
 
@@ -1162,6 +1372,8 @@ impl App {
                     self.orient_panel = false;
                 } else if self.export_panel {
                     self.export_panel = false;
+                } else if self.sub_panel {
+                    self.sub_panel = false;
                 } else {
                     self.sidebar = !self.sidebar;
                 }
@@ -1175,12 +1387,15 @@ impl App {
                 cx.notify();
             }
             "o" if m.control => self.pick_folder(cx),
-            // ⌘D = 把 iPlayer 设为默认播放器（对应右上角那颗链条图标）
+            // ⌘D = 把 iPlayer 设为默认播放器（链条图标已从标题栏去掉，
+            // 这里是界面里剩下的唯一入口；命令行还有 `iplayer --set-default`）
             "d" if m.control => self.set_default_player(cx),
             "f" if !m.control => self.toggle_fullscreen(window, cx),
             "t" if !m.control => self.toggle_pin(window, cx),
             // 画面比例循环（`a`）已随"裁切"按钮一起移除
             "e" if !m.control => self.toggle_export_panel(cx),
+            // 字幕显示 / 隐藏（面板里也有一行，快捷键只是图快）
+            "s" if !m.control => self.toggle_subtitles(cx),
             // 信息浮层按钮已从控制条移除，改由快捷键开关
             "i" if !m.control => {
                 self.show_info = !self.show_info;
@@ -1534,70 +1749,41 @@ impl App {
                     .flex_none()
                     .items_center()
                     .gap(px(3.))
-                    // 置顶放最左（用户要求），其后是画面角度、导出工具箱、全屏；
-                    // 原"裁切"（画面比例循环）按钮已按用户要求整个去掉
+                    // 右上角这一排，用户指定的顺序（从左到右）：
+                    // 深浅色 · 置顶 · 最小化 · 最大化 · 关闭。
+                    // 原先挤在这里的画面角度 / 工具箱 / 全屏挪到了底部控制条
+                    // （截图按钮右侧），「链条」（设默认播放器）图标整个去掉 ——
+                    // 功能保留在快捷键 ⌘D 和 `iplayer --set-default`。
+                    .child(
+                        self.icon_btn("tb-theme", if self.dark { "sun" } else { "moon" }, 26.)
+                            .debug_selector(|| "tb-theme".to_string())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.dark = !this.dark;
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         self.icon_btn_c("tb-pin", "pin", 26., self.tb_color(self.pinned), self.pinned)
+                            .debug_selector(|| "tb-pin".to_string())
                             .on_click(cx.listener(|this, _, window, cx| this.toggle_pin(window, cx))),
                     )
                     .child(
-                        // 画面上被调过角度时按钮也亮着，一眼能看出"现在不是原始朝向"
-                        self.icon_btn_c(
-                            "tb-orient",
-                            "rotate",
-                            26.,
-                            self.tb_color(self.orient_panel || !self.orient.is_identity()),
-                            self.orient_panel || !self.orient.is_identity(),
-                        )
-                        .debug_selector(|| "tb-orient".to_string())
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_orient_panel(cx))),
+                        self.icon_btn("tb-min", "minimize", 26.)
+                            .debug_selector(|| "tb-min".to_string())
+                            .on_click(cx.listener(|this, _, window, cx| this.minimize(window, cx))),
                     )
                     .child(
-                        self.icon_btn_c(
-                            "tb-export",
-                            "toolbox",
-                            26.,
-                            self.tb_color(self.export_panel),
-                            self.export_panel,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_export_panel(cx))),
+                        self.icon_btn("tb-max", "maximize", 26.)
+                            .debug_selector(|| "tb-max".to_string())
+                            .on_click(cx.listener(|this, _, window, cx| this.maximize(window, cx))),
                     )
+                    // 最右侧的 X：退出整个应用（与 main.rs 的 on_window_closed 行为
+                    // 一致 —— 窗口没了就退，Dock 里不会留下点不动的僵尸图标）
                     .child(
-                        self.icon_btn_c(
-                            "tb-full",
-                            "expand",
-                            26.,
-                            self.tb_color(self.fullscreen),
-                            self.fullscreen,
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| this.toggle_fullscreen(window, cx))),
-                    )
-                    // 关联 / 设为默认播放器：系统里媒体文件默认交给谁打开
-                    .child(
-                        self.icon_btn_c(
-                            "tb-default",
-                            "link",
-                            26.,
-                            pal.text(),
-                            self.is_default_player,
-                        )
-                        .debug_selector(|| "tb-default".to_string())
-                        .on_click(cx.listener(|this, _, _, cx| this.set_default_player(cx))),
+                        self.icon_btn("tb-close", "close", 26.)
+                            .debug_selector(|| "tb-close".to_string())
+                            .on_click(cx.listener(|_, _, _, cx| cx.quit())),
                     ),
-            )
-            .child(
-                self.icon_btn("tb-theme", if self.dark { "sun" } else { "moon" }, 26.)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.dark = !this.dark;
-                        cx.notify();
-                    })),
-            )
-            // 最右侧的 X：退出整个应用（与 main.rs 的 on_window_closed 行为
-            // 一致 —— 窗口没了就退，Dock 里不会留下点不动的僵尸图标）
-            .child(
-                self.icon_btn("tb-close", "close", 26.)
-                    .debug_selector(|| "tb-close".to_string())
-                    .on_click(cx.listener(|_, _, _, cx| cx.quit())),
             )
     }
 
@@ -1849,12 +2035,13 @@ impl App {
                         .into_any_element()
                 }
                 Stage::Audio => {
-                    // 只留均衡器可视化（音符 + 频谱柱）铺满整块播放区。
-                    // 用户要求：中间不要再显示曲名/codec，左上角也不要叠媒体信息。
+                    // 均衡器可视化铺满整块播放区，中间叠一行曲名
+                    //（用户要求「音乐播放时播放区域中间显示歌曲名称」）。
                     div()
                         .relative()
                         .size_full()
                         .child(self.viz.render(pal.text()))
+                        .children(self.now_playing(pal))
                         .into_any_element()
                 }
                 Stage::Empty if self.player.is_some() => {
@@ -1940,7 +2127,7 @@ impl App {
         };
 
         // 左上角媒体信息浮层：默认关（快捷键 i 可开）；
-        // 纯音频舞台一律不显示 —— 那块区域只留均衡器可视化。
+        // 纯音频舞台一律不显示 —— 那块区域只留均衡器 + 中央曲名（见 `now_playing`）。
         let overlay = if self.show_info && !matches!(self.stage, Stage::Audio) {
             self.info_lines().map(|(name, meta)| {
                 div()
@@ -1975,13 +2162,20 @@ impl App {
             None
         };
 
+        // 字幕层：载了字幕、且没被隐藏、且正播着东西，才会叠出来
+        let subtitle = self.render_subtitle();
+
         // 导出面板：右下角浮层。有任务在跑时强制显示。
+        // 同角度面板：面板内的按钮不许把点击漏给"点画面播/停"。
         let export_panel = if self.export_panel || self.export.is_some() {
             Some(
                 div()
+                    .id("export-panel")
                     .absolute()
                     .right(px(12.))
                     .bottom(px(12.))
+                    .debug_selector(|| "export-panel".to_string())
+                    .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
                     .child(self.render_export_panel(cx, pal))
                     .into_any_element(),
             )
@@ -1989,13 +2183,19 @@ impl App {
             None
         };
 
-        // 画面角度面板：右上角浮层，紧挨着工具栏那颗按钮的下方
+        // 画面角度面板：**右下角**浮层（用户指定，从右上角挪下来），
+        // 与导出面板同位 —— 两者互斥（开一个会收起另一个），不会叠。
+        // 浮层自己吃掉点击 —— 否则点面板里的按钮会冒泡到舞台根节点的
+        // 「点画面播放 / 暂停」上，转个角度顺带把片子暂停了。
         let orient_panel = if self.orient_panel {
             Some(
                 div()
+                    .id("orient-panel")
+                    .debug_selector(|| "orient-panel".to_string())
                     .absolute()
                     .right(px(12.))
-                    .top(px(10.))
+                    .bottom(px(12.))
+                    .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
                     .child(self.render_orient_panel(cx, pal))
                     .into_any_element(),
             )
@@ -2003,7 +2203,26 @@ impl App {
             None
         };
 
+        // 字幕面板：第三个右下角浮层（与角度 / 导出面板互斥）。
+        let sub_panel = if self.sub_panel {
+            Some(
+                div()
+                    .id("sub-panel")
+                    .debug_selector(|| "sub-panel".to_string())
+                    .absolute()
+                    .right(px(12.))
+                    .bottom(px(12.))
+                    .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                    .child(self.render_sub_panel(cx, pal))
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+
         div()
+            .id("stage")
+            .debug_selector(|| "stage".to_string())
             .relative()
             .flex()
             .items_center()
@@ -2012,11 +2231,117 @@ impl App {
             .min_h(px(0.))
             .overflow_hidden()
             .bg(pal.stage())
+            // 点画面 = 播放 / 暂停（照大多数播放器的习惯）。
+            // 没打开媒体时 `toggle()` 自己会空转，所以落地页上点空白处什么也不会发生；
+            // 两个浮层面板已经 `stop_propagation`，不会误触。
+            .when(self.player.is_some(), |d| d.cursor_pointer())
+            .on_click(cx.listener(|this, _, _, cx| this.toggle(cx)))
             .child(body)
+            // 字幕压在画面下方，但要在几个浮层**之下**（浮层是操作区，不能被字幕盖住）
+            .children(subtitle)
             .children(overlay)
             .children(orient_panel)
             .children(export_panel)
+            .children(sub_panel)
             .into_any_element()
+    }
+
+    /// 音频舞台中央显示的曲名（没在播东西 / 拿不到名字就返回 None）。
+    fn audio_title(&self) -> Option<String> {
+        song_title(
+            self.info.as_ref().map(|i| i.title.as_str()),
+            self.active_path.as_deref(),
+        )
+    }
+
+    /// 音频舞台中间的曲名浮层：一个音符 + 一行曲名。
+    ///
+    /// 位置**顶在画面 30% 高度处**，而不是正好居中 —— 频谱柱最高能顶到
+    /// 41% 处，摆正中会被柱子从下面穿过。横向整幅铺开、内容居中，
+    /// 长曲名按 62% 宽度自动折行并居中。
+    ///
+    /// 这一层不带任何交互，所以点击照样落到舞台根节点上：
+    /// 点曲名和点别处一样能播放 / 暂停。
+    fn now_playing(&self, pal: &'static Palette) -> Option<AnyElement> {
+        let title = self.audio_title()?;
+        Some(
+            div()
+                .absolute()
+                .top(relative(0.30))
+                .left_0()
+                .right_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(10.))
+                .child(self.icon_el("music", 24., pal.muted()))
+                .child(
+                    div()
+                        .max_w(relative(0.62))
+                        .text_center()
+                        .text_size(px(20.))
+                        .line_height(px(27.))
+                        .text_color(pal.text())
+                        .debug_selector(|| "now-playing".to_string())
+                        .child(SharedString::from(title)),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// 叠在画面下方的字幕。
+    ///
+    /// 横向铺满、内容居中，靠**下边距 6%** 定位（落在控制条之上、离画面中心远远的）；
+    /// 多行逐行渲染（字幕里的换行是硬换行）。底衬是半透明黑 + 白字：
+    /// 字幕底下的画面内容不可控，只有这样才能保证亮画面黑字、暗画面白字都看清，
+    /// 所以这一层不跟主题走（深浅两套主题下长得一样）。
+    fn render_subtitle(&self) -> Option<AnyElement> {
+        if !self.sub_visible {
+            return None;
+        }
+        let subs = self.subs.as_ref()?;
+        let pos = self.player.as_ref()?.position();
+        let text = subs.at(pos)?;
+
+        let size = SUB_FONT * self.sub_scale();
+        let ink = gpui_kit::Hsla::from(gpui_kit::rgb(0xf7f8fa));
+        let lines: Vec<AnyElement> = text
+            .lines()
+            .map(|line| {
+                div()
+                    .text_size(px(size))
+                    .line_height(px(size * 1.35))
+                    .text_color(ink)
+                    .child(SharedString::from(line.to_string()))
+                    .into_any_element()
+            })
+            .collect();
+
+        Some(
+            div()
+                .absolute()
+                .bottom(relative(0.06))
+                .left_0()
+                .right_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(
+                    div()
+                        .id("subtitle")
+                        .debug_selector(|| "subtitle".to_string())
+                        .max_w(relative(0.84))
+                        .px(px(12.))
+                        .py(px(4.))
+                        .rounded_md()
+                        .bg(gpui_kit::Hsla::from(gpui_kit::rgb(0x000000)).opacity(0.62))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .children(lines),
+                )
+                .into_any_element(),
+        )
     }
 
     /// 画面角度面板：四向调整 + 复位，顶部显示当前朝向。
@@ -2105,6 +2430,112 @@ impl App {
         .into_any_element()
     }
 
+    /// 字幕面板里的一行（图标 + 文字，右侧一条小提示）——
+    /// 四行共用同一副骨架，动作各自由调用处挂 `.on_click`。
+    ///
+    /// `on` = 这一行"现在能起作用"：不能时文字压暗（比如没有字幕时的
+    /// 显示 / 隐藏与移除），点了只会得到一句提示而不是静默。
+    fn sub_row(
+        &self,
+        pal: &'static Palette,
+        id: &'static str,
+        icon: &'static str,
+        label: &str,
+        hint: &str,
+        on: bool,
+    ) -> Stateful<Div> {
+        let fg = if on { pal.text() } else { pal.muted().opacity(0.7) };
+        div()
+            .id(id)
+            .debug_selector(move || id.to_string())
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(8.))
+            .px(px(8.))
+            .py(px(6.))
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(fg)
+            .hover(|s| s.bg(pal.hover()))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.))
+                    .overflow_hidden()
+                    .child(self.icon_el(icon, 14., pal.muted()))
+                    .child(div().text_size(px(12.)).child(SharedString::from(label.to_string()))),
+            )
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(pal.muted())
+                    .child(SharedString::from(hint.to_string())),
+            )
+    }
+
+    /// 字幕面板：导入 · 显示/隐藏 · 字号 · 移除，顶部一行写明当前字幕。
+    fn render_sub_panel(&self, cx: &mut Context<Self>, pal: &'static Palette) -> AnyElement {
+        const CARD_W: f32 = 236.0;
+        let has = self.subs.is_some();
+
+        let head = match &self.subs {
+            Some(s) => format!("{} · {} 条", s.name, s.len()),
+            None => "未载入（可自动找同名字幕）".to_string(),
+        };
+        let toggle_label = if self.sub_visible { "隐藏字幕" } else { "显示字幕" };
+        let size_label = SUB_SIZE_LABELS[self.sub_size.min(SUB_SIZE_LABELS.len() - 1)];
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .w(px(CARD_W))
+            .p(px(10.))
+            .rounded_md()
+            .bg(pal.panel().opacity(0.97))
+            .border_1()
+            .border_color(pal.line())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .px(px(8.))
+                    .pb(px(4.))
+                    .child(self.icon_el("captions", 13., pal.muted()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(pal.muted())
+                            .child(SharedString::from(head)),
+                    ),
+            )
+            .child(
+                self.sub_row(pal, "sub-import", "download", "导入字幕…", ".srt · .vtt · .ass", true)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.request_import_subtitle(window, cx)
+                    })),
+            )
+            .child(
+                self.sub_row(pal, "sub-toggle", "captions", toggle_label, "S", has)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_subtitles(cx))),
+            )
+            .child(
+                self.sub_row(pal, "sub-size", "expand", "字幕大小", size_label, true)
+                    .on_click(cx.listener(|this, _, _, cx| this.cycle_sub_size(cx))),
+            )
+            .child(
+                self.sub_row(pal, "sub-remove", "close", "移除字幕", "", has)
+                    .on_click(cx.listener(|this, _, _, cx| this.remove_subtitle(cx))),
+            )
+            .into_any_element()
+    }
+
     /// 导出面板：空闲时列三个动作，跑任务时显示进度和取消按钮。
     fn render_export_panel(
         &self,
@@ -2175,8 +2606,14 @@ impl App {
                 export::Kind::Audio => "download",
                 export::Kind::Gif => "gif",
             };
+            let sel = match kind {
+                export::Kind::Snapshot => "export-snapshot",
+                export::Kind::Audio => "export-audio",
+                export::Kind::Gif => "export-gif",
+            };
             div()
                 .id(("export-row", kind as usize))
+                .debug_selector(move || sel.to_string())
                 .flex()
                 .items_center()
                 .justify_between()
@@ -2329,8 +2766,8 @@ impl App {
                 self.icon_btn_sz(
                     "loop",
                     match self.loop_mode {
-                        LoopMode::One => "repeat1",
-                        _ => "repeat",
+                        LoopMode::One => "loop1",
+                        _ => "loop",
                     },
                     36.,
                     PLAY_ICON,
@@ -2339,19 +2776,48 @@ impl App {
                     pal.text(),
                     self.loop_mode.is_on(),
                 )
+                .debug_selector(|| "loop".to_string())
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.loop_mode = this.loop_mode.next();
                     let msg = this.loop_mode.toast();
                     this.toast(msg, cx);
                 })),
             )
-            // 「信息」按钮已按用户要求从控制条去掉；浮层仍可用快捷键 i 开关
+            // 「信息」按钮已按用户要求从控制条去掉；浮层仍可用快捷键 i 开关。
+            // 「截图」按钮也去掉了 —— 工具箱面板里本来就有这一项（少一颗重复按钮）。
+            // 循环右边这组"画面工具"（用户指定）：切换方向 · 工具箱。
+            // 原先都在标题栏右上角，那一片现在只留窗口类操作
+            // （置顶 / 深浅色 / 最小化 / 最大化 / 关闭）。全屏没有再给按钮 ——
+            // 绿色交通灯和快捷键 ⌘F 都还在。开关态照旧靠底色高亮，不用暗色。
             .child(
-                self.icon_btn_sz("shot", "camera", 36., PLAY_ICON, pal.text(), false)
-                    .debug_selector(|| "shot".to_string())
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.request_export(export::Kind::Snapshot, window, cx)
-                    })),
+                self.icon_btn_sz(
+                    "ctl-orient",
+                    "rotate",
+                    36.,
+                    PLAY_ICON,
+                    pal.text(),
+                    self.orient_panel || !self.orient.is_identity(),
+                )
+                .debug_selector(|| "ctl-orient".to_string())
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_orient_panel(cx))),
+            )
+            // 字幕（用户要求：加在「工具箱」左侧）：导入 / 显示隐藏 / 字号 / 移除
+            .child(
+                self.icon_btn_sz(
+                    "ctl-sub",
+                    "captions",
+                    36.,
+                    PLAY_ICON,
+                    pal.text(),
+                    self.sub_panel || (self.subs.is_some() && self.sub_visible),
+                )
+                .debug_selector(|| "ctl-sub".to_string())
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_sub_panel(cx))),
+            )
+            .child(
+                self.icon_btn_sz("ctl-export", "toolbox", 36., PLAY_ICON, pal.text(), self.export_panel)
+                    .debug_selector(|| "ctl-export".to_string())
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_export_panel(cx))),
             );
 
         // 右组永远套一个跟左侧时间区等宽的 `1fr`，左右一配对，
@@ -3105,9 +3571,14 @@ mod orient_tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{Modifiers, Pixels, TestAppContext, VisualTestContext};
 
     use super::*;
+
+    /// `Pixels` 的字段是私有的，量几何一律先换成 f32。
+    fn n(v: Pixels) -> f32 {
+        f32::from(v)
+    }
 
     fn harness(
         cx: &mut TestAppContext,
@@ -3193,8 +3664,8 @@ mod orient_tests {
         assert_eq!(px_, [0, 0, 0, 255], "原图左上角是 (x=0, y=0)");
 
         assert!(
-            cx.debug_bounds("tb-orient").is_some(),
-            "右上角应当有画面角度这颗按钮"
+            cx.debug_bounds("ctl-orient").is_some(),
+            "控制条上应当有画面角度这颗按钮（已从标题栏挪过来）"
         );
 
         open_panel(cx, &held);
@@ -3249,6 +3720,36 @@ mod orient_tests {
         assert!(
             cx.debug_bounds("orient-cw").is_some(),
             "面板应当还开着，方便用户再点"
+        );
+    }
+
+    /// 角度面板贴在舞台**右下角**（用户指定，从右上角挪下来），
+    /// 且与导出面板同位 —— 右缘、下缘到舞台边的距离应当一致。
+    #[gpui::test]
+    fn orient_panel_docks_bottom_right(cx: &mut TestAppContext) {
+        let (cx, held) = harness(cx);
+        let _app = open_panel(cx, &held);
+
+        let panel = cx
+            .debug_bounds("orient-panel")
+            .expect("展开开关后应当渲染角度面板");
+        let stage = cx.debug_bounds("stage").expect("舞台应当被渲染");
+
+        let right_gap = n(stage.origin.x + stage.size.width)
+            - n(panel.origin.x + panel.size.width);
+        let bottom_gap = n(stage.origin.y + stage.size.height) - n(panel.origin.y + panel.size.height);
+        // 四个边距是同一个设计值（导出面板也是 12px），两条边得一致
+        assert!(
+            (right_gap - bottom_gap).abs() < 1.0,
+            "面板右下内缩应当一致（右 {right_gap:.1} / 下 {bottom_gap:.1}）"
+        );
+        assert!(
+            (8.0..16.0).contains(&right_gap),
+            "面板应当贴住右下角（实测内缩 {right_gap:.1}px）"
+        );
+        assert!(
+            n(panel.center().y) > n(stage.center().y),
+            "面板应当落在舞台下半区（不再是右上角）"
         );
     }
 
@@ -3459,7 +3960,35 @@ mod export_click_tests {
         redraw(cx);
     }
 
-    /// 点"截图"按钮绝不能把进程带走。
+    fn n(v: gpui::Pixels) -> f32 {
+        f32::from(v)
+    }
+
+    /// 工具箱面板三行都在、顺序是 截图 · 提取音频 · 转 GIF ——
+    /// 控制条那颗截图按钮移除后，这里是截图**唯一**的入口，不能悄悄少一行。
+    #[gpui::test]
+    fn toolbox_keeps_all_three_export_rows(cx: &mut TestAppContext) {
+        let (cx, held) = harness(cx);
+        let app = held.borrow().as_ref().expect("App 实体").clone();
+        app.update_in(cx, |v, _w, cx| v.toggle_export_panel(cx));
+        redraw(cx);
+
+        let shot = cx.debug_bounds("export-snapshot").expect("截图行应当存在");
+        let audio = cx.debug_bounds("export-audio").expect("提取音频行应当存在");
+        let gif = cx.debug_bounds("export-gif").expect("转 GIF 行应当存在");
+        assert!(
+            n(shot.center().y) < n(audio.center().y) && n(audio.center().y) < n(gif.center().y),
+            "三行应当自上而下依次是 截图 / 提取音频 / 转 GIF"
+        );
+        for other in [audio, gif] {
+            assert!(
+                (n(other.center().x) - n(shot.center().x)).abs() < 1.0,
+                "三行应当左对齐在同一列"
+            );
+        }
+    }
+
+    /// 点"截图"绝不能把进程带走。
     ///
     /// 这里钉的是用户报的"点截图 / 转 GIF / 提取音频就崩"：rfd 的 macOS 后端在
     /// 它认为环境不支持时会**静默退回同步 `runModal`**，而回退路径要么直接
@@ -3467,8 +3996,10 @@ mod export_click_tests {
     /// 主线程里再套一层事件循环、把外层的 GPUI 事件分发重入 → 撞 ObjC 边界
     /// 无法 unwind → abort。所以 `request_export` 现在先自查环境、再
     /// `catch_unwind` 兜底：无论支持不支持，点击的结果只能是"弹面板"或"给提示"。
+    ///
+    /// 入口是**工具箱面板**里的那一行（控制条上的截图按钮已按用户要求移除）。
     #[gpui::test]
-    fn clicking_snapshot_button_never_panics(cx: &mut TestAppContext) {
+    fn clicking_snapshot_row_never_panics(cx: &mut TestAppContext) {
         let (cx, held) = harness(cx);
         let app = held.borrow().as_ref().expect("App 实体").clone();
         app.update_in(cx, |v, _w, cx| {
@@ -3476,7 +4007,16 @@ mod export_click_tests {
         });
         redraw(cx);
 
-        click(cx, "shot");
+        // 控制条上不该再有截图按钮
+        assert!(
+            cx.debug_bounds("shot").is_none(),
+            "控制条上的截图按钮应当已移除（工具箱里保留入口）"
+        );
+
+        // 展开工具箱，点里面的"截图"行
+        app.update_in(cx, |v, _w, cx| v.toggle_export_panel(cx));
+        redraw(cx);
+        click(cx, "export-snapshot");
         let (dialog, export, toast) = cx.update(|_, cx| {
             let a = app.read(cx);
             (
@@ -3500,7 +4040,7 @@ mod export_click_tests {
 
         // 面板开着的话，再点一次也得是提示而不是崩
         if dialog {
-            click(cx, "shot");
+            click(cx, "export-snapshot");
         }
 
         // 走完了还在，能正常读状态就说明没 abort
@@ -3517,5 +4057,827 @@ mod export_click_tests {
             panic!("{}", String::from("格式化的消息"))
         });
         assert_eq!(panic_reason(&caught.unwrap_err()), "格式化的消息");
+    }
+}
+
+/// 舞台「点画面 = 播放 / 暂停」的回归。
+///
+/// 两个要点，缺一条都不算做完：
+/// 1. 点画面真能切换播放状态（这是用户要的功能）；
+/// 2. 右上角角度面板 / 右下角导出面板里的按钮**不许**把点击漏给舞台 ——
+///    浮层是绝对定位的**兄弟**节点，gpui 的命中测试会把同一个点上的所有
+///    hitbox 都收进来（`Window::hit_test` 里按绘制顺序反向遍历、直到有人
+///    `BlockMouse`），所以祖先/兄弟都在一条冒泡链上，不 `stop_propagation`
+///    就会出现"转个角度顺手把片子暂停了"。
+#[cfg(test)]
+mod stage_click_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gpui::{Modifiers, TestAppContext, VisualTestContext, point};
+
+    use super::*;
+
+    fn harness(
+        cx: &mut TestAppContext,
+    ) -> (&mut VisualTestContext, Rc<RefCell<Option<Entity<App>>>>) {
+        cx.update(gpui_kit::init);
+        let held: Rc<RefCell<Option<Entity<App>>>> = Rc::new(RefCell::new(None));
+        let slot = held.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let app = App::new(window, cx);
+            *slot.borrow_mut() = Some(cx.entity());
+            app
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        (cx, held)
+    }
+
+    fn redraw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    /// 只有真解码出来的 `Player` 才有"播放 / 暂停"可切，所以借
+    /// `player::tests` 那份缓存短片（同一目录，谁先跑谁造）；没有 ffmpeg
+    /// 就当环境问题跳过，别把缺依赖算成回归。
+    fn test_clip() -> Option<PathBuf> {
+        let dir = std::env::temp_dir().join("iplayer-scrub-test");
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join("clip.mp4");
+        if !path.exists() {
+            let mut cmd = crate::ffmpeg::base_command().ok()?;
+            let ok = cmd
+                .args(["-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc=size=160x120:rate=25:duration=4")
+                .args(["-pix_fmt", "yuv420p", "-an", "-y"])
+                .arg(&path)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok || !path.exists() {
+                return None;
+            }
+        }
+        Some(path)
+    }
+
+    fn open_video(
+        cx: &mut VisualTestContext,
+        held: &Rc<RefCell<Option<Entity<App>>>>,
+        clip: &PathBuf,
+    ) -> Entity<App> {
+        let app = held.borrow().as_ref().expect("App 实体").clone();
+        app.update_in(cx, |view, _window, cx| view.open_file(clip.clone(), cx));
+        redraw(cx);
+        app
+    }
+
+    fn is_playing(cx: &mut VisualTestContext, app: &Entity<App>) -> Option<bool> {
+        cx.update(|_, cx| app.read(cx).player.as_ref().map(|p| p.is_playing()))
+    }
+
+    /// 点画面：播放 ↔ 暂停，来回都对。
+    #[gpui::test]
+    fn clicking_the_stage_toggles_playback(cx: &mut TestAppContext) {
+        let Some(clip) = test_clip() else {
+            return;
+        };
+        let (cx, held) = harness(cx);
+        let app = open_video(cx, &held, &clip);
+        let Some(playing) = is_playing(cx, &app) else {
+            return; // 打开失败（探针 / 解码环境问题），不当回归
+        };
+        assert!(playing, "刚打开应当正在播放");
+
+        let stage = cx.debug_bounds("stage").expect("舞台应当被渲染");
+        cx.simulate_click(stage.center(), Modifiers::default());
+        redraw(cx);
+        assert_eq!(
+            is_playing(cx, &app),
+            Some(false),
+            "点一下画面应当暂停（这是用户要的功能）"
+        );
+
+        cx.simulate_click(stage.center(), Modifiers::default());
+        redraw(cx);
+        assert_eq!(is_playing(cx, &app), Some(true), "再点一下应当继续播放");
+    }
+
+    /// 浮层面板里的点击要被面板自己吃掉，不能顺手把播放切了。
+    #[gpui::test]
+    fn clicks_inside_panels_do_not_toggle_playback(cx: &mut TestAppContext) {
+        let Some(clip) = test_clip() else {
+            return;
+        };
+        let (cx, held) = harness(cx);
+        let app = open_video(cx, &held, &clip);
+        if is_playing(cx, &app).is_none() {
+            return;
+        }
+
+        // ① 角度面板：点「左转 90°」——动作要生效，播放状态要原地不动
+        app.update_in(cx, |view, _window, cx| view.toggle_orient_panel(cx));
+        redraw(cx);
+        let row = cx
+            .debug_bounds("orient-ccw")
+            .expect("角度面板应当被渲染");
+        cx.simulate_click(row.center(), Modifiers::default());
+        redraw(cx);
+        let (playing, rot) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            (
+                a.player.as_ref().map(|p| p.is_playing()),
+                a.orient.rot,
+            )
+        });
+        assert_eq!(rot, 270, "「左转 90°」应当作用到画面上");
+        assert_eq!(playing, Some(true), "点角度面板不该顺带暂停播放");
+
+        // ② 导出面板：点卡片顶部的标题区（三行动作之上），面板吃掉点击，
+        //    既不弹导出面板、也不切播放状态。
+        app.update_in(cx, |view, _window, cx| view.toggle_export_panel(cx));
+        redraw(cx);
+        let card = cx.debug_bounds("export-panel").expect("导出面板应当被渲染");
+        let head = point(card.center().x, card.origin.y + px(15.));
+        cx.simulate_click(head, Modifiers::default());
+        redraw(cx);
+        let (playing, dialog, export) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            (
+                a.player.as_ref().map(|p| p.is_playing()),
+                a.dialog.is_some(),
+                a.export.is_some(),
+            )
+        });
+        assert_eq!(playing, Some(true), "点导出面板不该顺带暂停播放");
+        assert!(
+            !dialog && !export,
+            "这里点的应当是面板标题（空白），没碰到动作行：dialog={dialog} export={export}"
+        );
+    }
+}
+
+/// 字幕（控制条「工具箱」左侧那颗 + 面板 + 画面上的字幕层）的回归。
+///
+/// 用户要求的是三件事：图标放在工具箱**左侧**、点开能**导入字幕**、能**隐藏字幕**。
+/// 时间轴本身（SRT / VTT / ASS 的解析、`start <= t < end` 的取条）由
+/// `crate::subtitle` 的单测钉住，这里只管 UI 这条路：按钮在哪、面板怎么开、
+/// 字幕层什么时候出现、几点几何关系。
+#[cfg(test)]
+mod subtitle_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gpui::{Modifiers, Pixels, TestAppContext, VisualTestContext};
+
+    use super::*;
+
+    fn n(v: Pixels) -> f32 {
+        f32::from(v)
+    }
+
+    fn harness(
+        cx: &mut TestAppContext,
+    ) -> (&mut VisualTestContext, Rc<RefCell<Option<Entity<App>>>>) {
+        cx.update(gpui_kit::init);
+        let held: Rc<RefCell<Option<Entity<App>>>> = Rc::new(RefCell::new(None));
+        let slot = held.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let app = App::new(window, cx);
+            *slot.borrow_mut() = Some(cx.entity());
+            app
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        (cx, held)
+    }
+
+    fn redraw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    fn click(cx: &mut VisualTestContext, sel: &'static str) {
+        let b = cx
+            .debug_bounds(sel)
+            .unwrap_or_else(|| panic!("{sel} 应当被渲染"));
+        cx.simulate_click(b.center(), Modifiers::default());
+        redraw(cx);
+    }
+
+    fn app_of(held: &Rc<RefCell<Option<Entity<App>>>>) -> Entity<App> {
+        held.borrow().as_ref().expect("App 实体").clone()
+    }
+
+    /// 借 `player::tests` 那份缓存短片，复制成本测试专用的一份，
+    /// 再在它旁边放一份**同名**字幕 —— 这样一次就把"自动找 sidecar"也测到。
+    fn clip_with_subtitle() -> Option<(PathBuf, PathBuf)> {
+        let src = std::env::temp_dir().join("iplayer-scrub-test").join("clip.mp4");
+        if !src.exists() {
+            return None; // 没有缓存短片（缺 ffmpeg）就跳过，不算回归
+        }
+        let dir = std::env::temp_dir().join("iplayer-sub-case");
+        std::fs::create_dir_all(&dir).ok()?;
+        let media = dir.join("sub-case.mp4");
+        let sub = dir.join("sub-case.srt");
+        std::fs::copy(&src, &media).ok()?;
+        std::fs::write(
+            &sub,
+            "1\n00:00:00,000 --> 01:00:00,000\n测试字幕\n\n2\n01:00:01,000 --> 01:00:02,000\n很后面的一条\n",
+        )
+        .ok()?;
+        Some((media, sub))
+    }
+
+    /// 面板开关 + 三个右下角浮层互斥（都在同一个角上，不能叠着）。
+    #[gpui::test]
+    fn subtitle_panel_toggles_and_shares_the_corner(cx: &mut TestAppContext) {
+        let (cx, held) = harness(cx);
+        let app = app_of(&held);
+
+        app.update_in(cx, |v, _w, cx| v.toggle_sub_panel(cx));
+        redraw(cx);
+        for sel in ["sub-import", "sub-toggle", "sub-size", "sub-remove"] {
+            assert!(
+                cx.debug_bounds(sel).is_some(),
+                "字幕面板里应当有 {sel} 这一行"
+            );
+        }
+
+        // 与角度 / 导出面板同位：右下内缩应当一致
+        let panel = cx.debug_bounds("sub-panel").expect("字幕面板应当被渲染");
+        let stage = cx.debug_bounds("stage").expect("舞台应当被渲染");
+        let right_gap =
+            n(stage.origin.x + stage.size.width) - n(panel.origin.x + panel.size.width);
+        let bottom_gap =
+            n(stage.origin.y + stage.size.height) - n(panel.origin.y + panel.size.height);
+        assert!(
+            (right_gap - bottom_gap).abs() < 1.0,
+            "面板右下内缩应当一致（右 {right_gap:.1} / 下 {bottom_gap:.1}）"
+        );
+        assert!(
+            (8.0..16.0).contains(&right_gap),
+            "面板应当贴住右下角（实测内缩 {right_gap:.1}px）"
+        );
+
+        // 开导出面板 → 字幕面板让位；反过来也一样
+        app.update_in(cx, |v, _w, cx| v.toggle_export_panel(cx));
+        redraw(cx);
+        let (sub, export) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            (a.sub_panel, a.export_panel)
+        });
+        assert!(!sub && export, "开导出面板应当把字幕面板收起来");
+
+        app.update_in(cx, |v, _w, cx| v.toggle_sub_panel(cx));
+        redraw(cx);
+        let (sub, export) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            (a.sub_panel, a.export_panel)
+        });
+        assert!(sub && !export, "再开字幕面板应当把导出面板收起来");
+    }
+
+    /// 点「导入字幕…」绝不能把进程带走（同导出那套：非阻塞面板或一句提示）。
+    #[gpui::test]
+    fn clicking_import_row_never_panics(cx: &mut TestAppContext) {
+        let (cx, held) = harness(cx);
+        let app = app_of(&held);
+        app.update_in(cx, |v, _w, cx| v.toggle_sub_panel(cx));
+        redraw(cx);
+        click(cx, "sub-import");
+
+        let (dialog, toast) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            (a.sub_dialog.is_some(), a.toast.as_ref().map(|(m, _)| m.clone()))
+        });
+        if !dialog {
+            let msg = toast.expect("走不了非阻塞面板时必须给一句提示");
+            assert!(
+                msg.contains("文件面板"),
+                "提示要说明是文件面板的问题，实际是 {msg:?}"
+            );
+        }
+        // 没有字幕时点显示 / 隐藏：只提示，不许崩、也不许把状态改成"已载入"
+        click(cx, "sub-toggle");
+        assert!(
+            cx.update(|_, cx| app.read(cx).subs.is_none()),
+            "没导入字幕时不该凭空出现字幕"
+        );
+    }
+
+    /// 打开带同名字幕的视频：字幕层出现在画面下方；隐藏后消失；
+    /// 移除后再（手动）载入又回来。
+    #[gpui::test]
+    fn subtitle_shows_hides_and_reloads(cx: &mut TestAppContext) {
+        let Some((media, sub)) = clip_with_subtitle() else {
+            return;
+        };
+        let (cx, held) = harness(cx);
+        let app = app_of(&held);
+        app.update_in(cx, |v, _w, cx| v.open_file(media.clone(), cx));
+        redraw(cx);
+
+        let has_player = cx.update(|_, cx| app.read(cx).player.is_some());
+        if !has_player {
+            return; // 探针 / 解码环境问题，不当回归
+        }
+        assert!(
+            cx.update(|_, cx| app.read(cx).subs.is_some()),
+            "同名字幕（sub-case.srt）应当被自动载入"
+        );
+
+        let bounds = cx
+            .debug_bounds("subtitle")
+            .expect("当前时刻有字幕，画面上应当叠出字幕层");
+        let stage = cx.debug_bounds("stage").expect("舞台应当被渲染");
+        // 横向居中
+        let dx = (n(bounds.center().x) - n(stage.center().x)).abs();
+        assert!(dx < 2.0, "字幕应当横向居中，偏了 {dx:.1}px");
+        // 落在画面下半部，且没贴到最底边（下面还有控制条）
+        let h = n(stage.size.height);
+        let top_frac = (n(bounds.origin.y) - n(stage.origin.y)) / h;
+        let bottom_frac = (n(bounds.origin.y) + n(bounds.size.height) - n(stage.origin.y)) / h;
+        assert!(
+            top_frac > 0.6,
+            "字幕应当压在画面下方，实际从 {:.0}% 开始",
+            top_frac * 100.0
+        );
+        assert!(
+            bottom_frac < 0.99,
+            "字幕不该贴到舞台最底边（实测底缘 {:.0}%）",
+            bottom_frac * 100.0
+        );
+
+        // 隐藏 → 消失；再按一次 → 回来
+        app.update_in(cx, |v, _w, cx| v.toggle_subtitles(cx));
+        redraw(cx);
+        assert!(
+            cx.debug_bounds("subtitle").is_none(),
+            "隐藏字幕后画面上不该还有那一层"
+        );
+        assert!(!cx.update(|_, cx| app.read(cx).sub_visible));
+        app.update_in(cx, |v, _w, cx| v.toggle_subtitles(cx));
+        redraw(cx);
+        assert!(cx.debug_bounds("subtitle").is_some(), "再切一次应当显示回来");
+
+        // 移除 → 层没了、状态也清了
+        app.update_in(cx, |v, _w, cx| v.remove_subtitle(cx));
+        redraw(cx);
+        assert!(cx.debug_bounds("subtitle").is_none(), "移除后不该还有字幕层");
+        assert!(cx.update(|_, cx| app.read(cx).subs.is_none()));
+
+        // 手动载入（面板「导入字幕…」最终也是走这条路）→ 层回来
+        app.update_in(cx, |v, _w, cx| v.load_subtitle(sub.clone(), cx));
+        redraw(cx);
+        assert!(
+            cx.debug_bounds("subtitle").is_some(),
+            "手动载入字幕后应当重新叠出来"
+        );
+        // 载入会把"显示"重新打开（隐藏状态下导入一份新的，用户是要看的）
+        assert!(cx.update(|_, cx| app.read(cx).sub_visible));
+    }
+
+    /// 字号三档轮着来，并且真的反映在字幕层的尺寸上。
+    #[gpui::test]
+    fn subtitle_size_cycles(cx: &mut TestAppContext) {
+        let Some((media, _sub)) = clip_with_subtitle() else {
+            return;
+        };
+        let (cx, held) = harness(cx);
+        let app = app_of(&held);
+        app.update_in(cx, |v, _w, cx| v.open_file(media, cx));
+        redraw(cx);
+        if cx.update(|_, cx| app.read(cx).player.is_none()) {
+            return;
+        }
+        let before = cx.debug_bounds("subtitle").expect("应当有字幕层");
+
+        app.update_in(cx, |v, _w, cx| v.cycle_sub_size(cx)); // 中 → 大
+        redraw(cx);
+        let after = cx.debug_bounds("subtitle").expect("应当有字幕层");
+        assert!(
+            n(after.size.height) > n(before.size.height),
+            "调到「大」之后字幕层应当更高：{:.1} → {:.1}",
+            n(before.size.height),
+            n(after.size.height)
+        );
+        assert_eq!(cx.update(|_, cx| app.read(cx).sub_size), 2);
+        app.update_in(cx, |v, _w, cx| v.cycle_sub_size(cx)); // 大 → 小（转圈）
+        assert_eq!(cx.update(|_, cx| app.read(cx).sub_size), 0);
+    }
+
+    /// 换文件时字幕跟着走：切到没有同名字幕的文件，旧字幕不许赖在屏幕上。
+    #[gpui::test]
+    fn switching_files_drops_the_old_subtitle(cx: &mut TestAppContext) {
+        let Some((media, _sub)) = clip_with_subtitle() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join("iplayer-sub-case");
+        let other = dir.join("no-subs.mp4");
+        std::fs::copy(&media, &other).ok();
+        let (cx, held) = harness(cx);
+        let app = app_of(&held);
+        app.update_in(cx, |v, _w, cx| v.open_file(media, cx));
+        redraw(cx);
+        if cx.update(|_, cx| app.read(cx).player.is_none()) {
+            return;
+        }
+        assert!(cx.debug_bounds("subtitle").is_some());
+
+        app.update_in(cx, |v, _w, cx| v.open_file(other, cx));
+        redraw(cx);
+        assert!(
+            cx.update(|_, cx| app.read(cx).subs.is_none()),
+            "新文件没有同名字幕，旧的不该留下"
+        );
+        assert!(cx.debug_bounds("subtitle").is_none(), "画面上不该还有旧字幕");
+    }
+}
+
+/// 标题栏 / 控制条按钮排布的回归（用户明确指定的位置）：
+/// 右上角从左到右 = 深浅色 · 置顶 · 最小化 · 最大化 · 关闭；
+/// 循环右侧 = 切换方向 · 字幕 · 工具箱；「链条」（设默认播放器）与「截图」图标去掉
+/// （后者在工具箱面板里有入口）。全屏不再给按钮：绿色交通灯 + 快捷键 ⌘F 仍在。
+#[cfg(test)]
+mod toolbar_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gpui::{Pixels, TestAppContext, VisualTestContext};
+
+    use super::*;
+
+    fn n(v: Pixels) -> f32 {
+        f32::from(v)
+    }
+
+    fn harness(
+        cx: &mut TestAppContext,
+    ) -> (&mut VisualTestContext, Rc<RefCell<Option<Entity<App>>>>) {
+        cx.update(gpui_kit::init);
+        let held: Rc<RefCell<Option<Entity<App>>>> = Rc::new(RefCell::new(None));
+        let slot = held.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let app = App::new(window, cx);
+            *slot.borrow_mut() = Some(cx.entity());
+            app
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        (cx, held)
+    }
+
+    fn bounds(cx: &mut VisualTestContext, sel: &'static str) -> gpui::Bounds<Pixels> {
+        cx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel} 应当被渲染"))
+    }
+
+    /// 右上角这一排的成员与顺序。
+    #[gpui::test]
+    fn titlebar_right_cluster_order(cx: &mut TestAppContext) {
+        let (cx, _held) = harness(cx);
+
+        let order = ["tb-theme", "tb-pin", "tb-min", "tb-max", "tb-close"];
+        let mut prev: Option<gpui::Bounds<Pixels>> = None;
+        for sel in order {
+            let b = bounds(cx, sel);
+            if let Some(p) = prev {
+                let step = n(b.center().x) - n(p.center().x);
+                assert!(
+                    step > 20.0,
+                    "{sel} 应当排在上一颗按钮右边（间隔 {step:.1}px）"
+                );
+            }
+            prev = Some(b);
+        }
+
+        // 挪走的 / 去掉的都不该再出现在标题栏上
+        for gone in ["tb-orient", "tb-export", "tb-full", "tb-default"] {
+            assert!(
+                cx.debug_bounds(gone).is_none(),
+                "{gone} 不应该再被渲染（已挪到控制条 / 已删除）"
+            );
+        }
+    }
+
+    /// 底部控制条：循环右侧依次是 切换方向 · 字幕 · 工具箱，同一行、与循环键同尺寸。
+    #[gpui::test]
+    fn tools_sit_right_of_the_loop_button(cx: &mut TestAppContext) {
+        let (cx, _held) = harness(cx);
+
+        // 截图按钮已移除（工具箱里有），控制条上不该再有它
+        assert!(
+            cx.debug_bounds("shot").is_none(),
+            "控制条上的截图按钮应当已移除"
+        );
+
+        // 字幕按钮（用户要求）夹在「切换方向」和「工具箱」中间
+        let loop_btn = bounds(cx, "loop");
+        let order = ["ctl-orient", "ctl-sub", "ctl-export"];
+        let mut prev = loop_btn;
+        for sel in order {
+            let b = bounds(cx, sel);
+            let step = n(b.center().x) - n(prev.center().x);
+            assert!(step > 20.0, "{sel} 应当排在前一颗右边（间隔 {step:.1}px）");
+            let dy = (n(b.center().y) - n(loop_btn.center().y)).abs();
+            assert!(dy < 1.0, "{sel} 应当和循环按钮同一行（垂直偏差 {dy:.1}px）");
+            prev = b;
+        }
+
+        // 工具按钮与循环键同尺寸（同一排工具，不要忽大忽小）
+        let loop_b = bounds(cx, "loop");
+        for sel in ["ctl-orient", "ctl-sub", "ctl-export"] {
+            let b = bounds(cx, sel);
+            let diff = (n(b.size.width) - n(loop_b.size.width)).abs();
+            assert!(diff < 1.0, "{sel} 应当与循环键同宽，差 {diff:.1}px");
+        }
+
+        // 工具组整体落在右侧音量组那一头，而不是挤到播放组中间去
+        let row = bounds(cx, "ctrl-row");
+        let last = n(prev.center().x);
+        let right_edge = n(row.origin.x) + n(row.size.width);
+        assert!(
+            (right_edge - last).abs() < n(row.size.width) * 0.2,
+            "工具组应当贴近行尾：行宽 {:.0}，最后一颗中心离行尾 {:.0}px",
+            n(row.size.width),
+            right_edge - last
+        );
+    }
+}
+
+/// 默认窗宽（1180×760）下右侧这排**不能**挤到播放组 —— 1920 的测试窗太宽，
+/// 旧断言（间隔 > 60px）在那里是空过的；真窗宽 + 侧栏展开才是挤爆的地方。
+#[cfg(test)]
+mod toolbar_width_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use std::ops::Deref as _;
+
+    use gpui::{Bounds, Pixels, TestAppContext, VisualTestContext, WindowBounds, WindowOptions, size};
+
+    use super::*;
+
+    fn n(v: Pixels) -> f32 {
+        f32::from(v)
+    }
+
+    /// 与 `add_window_view` 同款，但用**真实的默认窗宽**开窗。
+    fn harness_at_default_size(
+        cx: &mut TestAppContext,
+    ) -> (&mut VisualTestContext, Rc<RefCell<Option<Entity<App>>>>) {
+        cx.update(gpui_kit::init);
+        let held: Rc<RefCell<Option<Entity<App>>>> = Rc::new(RefCell::new(None));
+        let slot = held.clone();
+        let opts = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin: Default::default(),
+                size: size(px(1180.), px(760.)),
+            })),
+            ..Default::default()
+        };
+        let window = cx.update(|cx| {
+            cx.open_window(opts, |window, cx| {
+                cx.new(|cx| {
+                    let app = App::new(window, cx);
+                    *slot.borrow_mut() = Some(cx.entity());
+                    app
+                })
+            })
+            .expect("测试窗口应当开得出来")
+        });
+        let mut v = VisualTestContext::from_window(*window.deref(), cx);
+        v.update(|window, cx| window.draw(cx).clear(cx));
+        let cx = v.into_mut();
+        (cx, held)
+    }
+
+    #[gpui::test]
+    fn right_cluster_never_crowds_the_play_group(cx: &mut TestAppContext) {
+        let (cx, _held) = harness_at_default_size(cx);
+
+        let b = |cx: &mut VisualTestContext, sel: &'static str| {
+            cx.debug_bounds(sel)
+                .unwrap_or_else(|| panic!("{sel} 应当被渲染"))
+        };
+        let row = b(cx, "ctrl-row");
+        let play = b(cx, "play-group");
+        let vol = b(cx, "vol-cluster");
+
+        // 播放组仍然整行居中
+        let drift = (n(play.center().x) - n(row.center().x)).abs();
+        assert!(drift < 8.0, "播放组偏离整行中心 {drift:.1}px");
+
+        // 右侧工具组不得压到播放组，且要留出呼吸空间
+        let gap = n(vol.origin.x) - (n(play.origin.x) + n(play.size.width));
+        assert!(
+            gap >= 24.0,
+            "默认窗宽下播放组与右侧工具组只剩 {gap:.1}px —— 右排太宽了"
+        );
+    }
+}
+
+/// 音乐舞台中央那行曲名的回归（用户要求「音乐播放时播放区域中间显示歌曲名称」）：
+/// 名字怎么取、什么时候显示、显示在哪儿。
+#[cfg(test)]
+mod now_playing_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gpui::{Pixels, TestAppContext, VisualTestContext};
+
+    use super::*;
+
+    fn n(v: Pixels) -> f32 {
+        f32::from(v)
+    }
+
+    // ── 曲名怎么取 ─────────────────────────────────────────────────────
+
+    /// 容器标签里的 title 优先，文件名兜底。
+    #[test]
+    fn title_comes_from_tags_then_from_the_file_name() {
+        assert_eq!(
+            song_title(Some(" 晴天 "), Some("/music/01 - track.mp3")),
+            Some("晴天".to_string()),
+            "有标签就用标签，且要去掉两端的空白"
+        );
+        assert_eq!(
+            song_title(Some("   "), Some("/music/01 - track.mp3")),
+            Some("01 - track".to_string()),
+            "标签是空白字符串 = 没标签，退回文件名（去掉扩展名）"
+        );
+        assert_eq!(
+            song_title(None, Some("/music/no-extension")),
+            Some("no-extension".to_string()),
+            "没有扩展名时文件名原样用"
+        );
+        assert_eq!(
+            song_title(None, Some("/music/.hidden")),
+            Some(".hidden".to_string()),
+            "点开头的隐藏文件也得有个名字，别退成空"
+        );
+        assert_eq!(song_title(None, None), None, "路径都没有就没什么可显示的");
+        assert_eq!(song_title(Some(""), None), None, "空标签 + 无路径 = 不显示");
+    }
+
+    // ── 什么时候显示、显示在哪儿 ───────────────────────────────────────
+
+    fn harness(
+        cx: &mut TestAppContext,
+    ) -> (&mut VisualTestContext, Rc<RefCell<Option<Entity<App>>>>) {
+        cx.update(gpui_kit::init);
+        let held: Rc<RefCell<Option<Entity<App>>>> = Rc::new(RefCell::new(None));
+        let slot = held.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let app = App::new(window, cx);
+            *slot.borrow_mut() = Some(cx.entity());
+            app
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        (cx, held)
+    }
+
+    /// 自造一段音频（内置 ffmpeg；机器上没有就跳过）。文件名 `tone.wav`
+    /// 同时也是这条测试期望的曲名 —— 它没有标签。
+    fn test_tone() -> Option<PathBuf> {
+        let dir = std::env::temp_dir().join("iplayer-scrub-test");
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join("tone.wav");
+        if !path.exists() {
+            let mut cmd = crate::ffmpeg::base_command().ok()?;
+            let ok = cmd
+                .args(["-v", "error", "-f", "lavfi", "-i"])
+                .arg("sine=frequency=440:duration=3")
+                .args(["-ac", "2", "-y"])
+                .arg(&path)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok || !path.exists() {
+                return None;
+            }
+        }
+        Some(path)
+    }
+
+    /// 自造一段**带标签**的音频（文件名故意叫 track，曲名在标签里）。
+    fn test_tagged_tone() -> Option<PathBuf> {
+        let dir = std::env::temp_dir().join("iplayer-scrub-test");
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join("track.m4a");
+        if !path.exists() {
+            let mut cmd = crate::ffmpeg::base_command().ok()?;
+            let ok = cmd
+                .args(["-v", "error", "-f", "lavfi", "-i"])
+                .arg("sine=frequency=660:duration=1")
+                .args(["-ac", "2", "-c:a", "aac", "-metadata"])
+                .arg("title=晴天")
+                .arg("-y")
+                .arg(&path)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok || !path.exists() {
+                return None;
+            }
+        }
+        Some(path)
+    }
+
+    /// 标签里的曲名要真能经 ffprobe 走到 `MediaInfo.title`（不然后面那条
+    /// 「标签优先」的规则只是空转）。
+    #[test]
+    fn tagged_title_reaches_media_info() {
+        let Some(tagged) = test_tagged_tone() else {
+            return;
+        };
+        let Ok(info) = crate::media::probe(&tagged) else {
+            return;
+        };
+        assert_eq!(info.title, "晴天", "容器标签里的 title 应当被读出来");
+        assert_eq!(
+            song_title(Some(&info.title), Some(&info.path)),
+            Some("晴天".to_string()),
+            "有标签就显示标签，而不是文件名 track"
+        );
+    }
+
+    fn open(
+        cx: &mut VisualTestContext,
+        held: &Rc<RefCell<Option<Entity<App>>>>,
+        path: &PathBuf,
+    ) -> Entity<App> {
+        let app = held.borrow().as_ref().expect("App 实体").clone();
+        app.update_in(cx, |view, _window, cx| view.open_file(path.clone(), cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        app
+    }
+
+    /// 播音乐：中间要有曲名，横向居中、纵向压在频谱柱上方。
+    #[gpui::test]
+    fn music_shows_the_title_above_the_spectrum(cx: &mut TestAppContext) {
+        let Some(tone) = test_tone() else {
+            return; // 没有 ffmpeg：跳过，别把环境问题算成回归
+        };
+        let (cx, held) = harness(cx);
+        let app = open(cx, &held, &tone);
+
+        let (stage_kind, title) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            (matches!(a.stage, Stage::Audio), a.audio_title())
+        });
+        if !stage_kind {
+            return; // 探针 / 解码环境问题
+        }
+        assert_eq!(
+            title.as_deref(),
+            Some("tone"),
+            "没有标签的音频就用文件名当曲名"
+        );
+
+        let bounds = cx
+            .debug_bounds("now-playing")
+            .expect("音频舞台上应当有曲名浮层");
+        let stage = cx.debug_bounds("stage").expect("舞台应当被渲染");
+
+        // 横向居中（整幅铺开的浮层 + 内容居中）
+        let dx = (n(bounds.center().x) - n(stage.center().x)).abs();
+        assert!(dx < 2.0, "曲名应当横向居中，偏了 {dx:.1}px");
+
+        // 纵向：在播放区上半部（不是贴着顶边），但完全落在频谱柱区（41% 起）之上
+        let h = n(stage.size.height);
+        let bar_top = n(stage.origin.y) + h * 0.41;
+        let title_bottom = n(bounds.origin.y) + n(bounds.size.height);
+        assert!(
+            title_bottom < bar_top,
+            "曲名底缘 {title_bottom:.0} 越过了频谱柱区顶部 {bar_top:.0} —— 会被柱子穿过"
+        );
+        let top_frac = (n(bounds.center().y) - n(stage.origin.y)) / h;
+        assert!(
+            (0.20..0.45).contains(&top_frac),
+            "曲名应当落在播放区中部偏上（实测 {:.0}%），既不能在正中挨柱子，也不能贴顶",
+            top_frac * 100.0
+        );
+    }
+
+    /// 视频不叠这层：曲名只在纯音频舞台出现。
+    #[gpui::test]
+    fn video_stage_has_no_title_overlay(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join("iplayer-scrub-test");
+        let clip = dir.join("clip.mp4");
+        if !clip.exists() {
+            return; // 借 player::tests 那份缓存短片，没有就跳过
+        }
+        let (cx, held) = harness(cx);
+        let app = open(cx, &held, &clip);
+        let stage_kind = cx.update(|_, cx| {
+            let a = app.read(cx);
+            matches!(a.stage, Stage::Audio)
+        });
+        if stage_kind {
+            return; // 打开失败 / 环境问题
+        }
+        assert!(
+            cx.debug_bounds("now-playing").is_none(),
+            "视频舞台上不该出现音乐曲名那一层"
+        );
     }
 }

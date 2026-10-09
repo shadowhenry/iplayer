@@ -5,6 +5,7 @@ mod icons;
 mod media;
 mod native;
 mod player;
+mod subtitle;
 mod theme;
 mod viz;
 
