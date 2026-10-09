@@ -1,13 +1,9 @@
 <h1 align="center">
-  <img src="icons/icon.png" alt="iPlayer logo" width="44" height="44" valign="middle">
+  <img src="docs/logo-rounded.png" alt="iPlayer logo" width="44" height="44" valign="middle">
   iPlayer - 本地媒体播放器
 </h1>
 
 <p align="center">基于 <b>Rust + GPUI</b> 的桌面媒体播放器，ffmpeg 解码直出纹理上屏，不产生任何转码缓存。</p>
-
-<p align="center">
-  <img src="docs/screenshot.jpg" alt="iPlayer 界面截图" width="760">
-</p>
 
 打开本地文件就能看、能听：视频与音频交给 ffmpeg 解码，解出的 BGRA 裸帧直接当纹理上屏，声音走 cpal；
 图片按格式分流给 `image`、resvg 或 ffmpeg 兜底。除播放之外还带一套导出工具箱（截图 / 提取音频 / 转 GIF），
@@ -24,6 +20,10 @@
 - 画面适应（适应 / 裁切 / 拉伸 / 原始）、全屏、窗口置顶
 - 媒体信息浮层：分辨率、帧率、编码与像素格式、声道、码率、体积、容器
 - 深色 / 浅色黑白配色一键切换；文件或文件夹可直接拖进窗口
+
+<p align="center">
+  <img src="docs/showcase.png" alt="iPlayer 播放界面" width="720">
+</p>
 
 ### 快捷键
 
