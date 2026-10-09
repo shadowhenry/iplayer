@@ -153,7 +153,11 @@ fn gui(initial: Option<std::path::PathBuf>) {
     // 事件有时比窗口先到（窗口建得慢），这里先捞一次，剩下的交给每帧的 tick
     let initial = initial.or_else(native::take_open_doc);
 
-    gpui_kit::application().run(move |cx| {
+    // Dock 图标被点（应用没有可见窗口时）：把藏起来的窗口亮回来。
+    // 注意 on_reopen 挂在 Application 上（run 之前注册），回调里才拿到 &mut App。
+    let application = gpui_kit::application();
+    application.on_reopen(|cx| show_main_window(cx));
+    application.run(move |cx| {
         gpui_kit::init(cx);
 
         let options = WindowOptions {
@@ -168,29 +172,45 @@ fn gui(initial: Option<std::path::PathBuf>) {
             ..Default::default()
         };
 
-        let handle = gpui_kit::open_window(options, cx, move |window, cx| {
-            let app = cx.new(|cx| app::App::new(window, cx));
-            if let Some(path) = initial {
-                app.update(cx, |app, cx| app.load_initial(path, cx));
-            }
-            app
-        })
-        .expect("打开窗口失败");
+        let (any_handle, _) =
+            gpui_kit::open_window(options, cx, move |window, cx| {
+                let app = cx.new(|cx| app::App::new(window, cx));
+                if let Some(path) = initial {
+                    app.update(cx, |app, cx| app.load_initial(path, cx));
+                }
+                app
+            })
+            .expect("打开窗口失败");
+        MAIN_WINDOW
+            .set(any_handle)
+            .expect("主窗口只会创建一次");
 
-        // 窗口全关了进程还赖在 Dock 上（点图标也没窗口弹出来）——
-        // 用户报过"应用停在程序坞，点击也不出现窗口"。macOS 的惯例是
-        // 最后一个窗口关掉应用就该退（文档类应用例外，我们只有一个窗口）。
-        let (any_handle, _) = handle;
-        let win_id = any_handle.window_id();
-        // 活到进程结束；Subscription 只是句柄，drop 不掉回调
-        let _sub = cx.on_window_closed(move |cx, closed| {
-            if closed == win_id {
-                cx.quit();
-            }
-        });
+        // 红绿灯关闭现在是"藏窗口"（见 App::new），所以不存在"窗口全关进程
+        // 还赖在 Dock"的问题了；这里不再 quit-on-close。
+
+        // Dock 右键菜单里的「显示主界面」。窗口活跃时动作派发给窗口内的
+        // 监听（App 根节点 on_action），否则走这条全局兜底 —— 两条路最终
+        // 都落到 native::show_window。
+        cx.on_action::<app::ShowMainWindow>(|_, cx| show_main_window(cx));
+        cx.set_dock_menu(vec![gpui_kit::MenuItem::action(
+            "显示主界面",
+            app::ShowMainWindow,
+        )]);
 
         cx.activate(true);
     });
+}
+
+/// 主窗口句柄：reopen / Dock 菜单动作都靠它把窗口亮回来。
+static MAIN_WINDOW: std::sync::OnceLock<gpui_kit::AnyWindowHandle> = std::sync::OnceLock::new();
+
+fn show_main_window(cx: &mut gpui_kit::App) {
+    if let Some(handle) = MAIN_WINDOW.get() {
+        let _ = handle.update(cx, |_, window, _| {
+            crate::native::show_window(window);
+        });
+    }
+    cx.activate(true);
 }
 
 /// 无窗口自测：验证解码 -> 呈现、seek、时钟是否都工作。

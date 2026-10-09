@@ -29,6 +29,9 @@ use crate::player::{Orientation, Player};
 use crate::theme::{self, Palette};
 use crate::viz;
 
+// Dock 右键菜单的「显示主界面」/ Dock 图标点击，把藏起来的窗口亮回来。
+gpui_kit::actions!(iplayer, [ShowMainWindow]);
+
 /// 空舞台 logo 的显示边长与圆角半径（用户要求 10px 圆角）。
 const LOGO_SIZE: f32 = 76.0;
 const LOGO_RADIUS: f32 = 10.0;
@@ -296,6 +299,15 @@ fn kind_cn(kind: &str) -> &'static str {
 
 impl App {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // 红绿灯的"关闭"= **藏起来**，不是销毁：窗口没了 App 状态（播放列表、
+        // 进度）就跟着没了，Dock 里也没法"回到主界面"。返回 false 拦下关闭，
+        // 再自己 orderOut；Dock 图标点击（on_reopen）/ Dock 菜单「显示主界面」
+        // 都能把它 orderFront 回来。真正退出走右上角的 X（cx.quit）。
+        window.on_window_should_close(cx, |window, _cx| {
+            native::hide_window(window);
+            false
+        });
+
         // 滑块 hover 时的描边环取的是组件主题的 ring 色 —— 在控制条上同样是
         // 一圈灰晕（用户视为"阴影"），直接全局关掉。搜索框的聚焦环也走这个
         // 颜色，输入框本身是无边框样式，关掉无碍。
@@ -2503,6 +2515,12 @@ impl Render for App {
             .track_focus(&focus)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 this.on_key(ev, window, cx)
+            }))
+            // Dock 菜单「显示主界面」在窗口还"活跃"（只是被 orderOut 藏了）
+            // 时走这条：把窗口亮回来。无活跃窗口时由 main.rs 里的全局监听兜住。
+            .on_action(cx.listener(|_, _: &ShowMainWindow, window, cx| {
+                native::show_window(window);
+                cx.notify();
             }))
             .flex()
             .flex_col()

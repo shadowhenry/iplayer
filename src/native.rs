@@ -90,6 +90,35 @@ mod imp {
         true
     }
 
+    /// 把窗口**藏起来**而不是关掉（红绿灯关闭走这条）。
+    ///
+    /// 窗口销毁了 App 状态就没了，之后 Dock 点图标也无法"回到主界面"——
+    /// 只能重建一个空窗口。orderOut 之后 AppKit 认为应用"没有可见窗口"，
+    /// 再点 Dock 图标会触发 `applicationShouldHandleReopen`（GPUI 的
+    /// `on_reopen`），把窗口 orderFront 回来即可。
+    pub fn hide_window(window: &Window) -> bool {
+        let Some(win) = ns_window(window) else {
+            return false;
+        };
+        win.orderOut(None);
+        true
+    }
+
+    /// 把隐藏的窗口亮回来（Dock 点击 / Dock 菜单「显示主界面」共用）。
+    pub fn show_window(window: &Window) -> bool {
+        let Some(win) = ns_window(window) else {
+            return false;
+        };
+        win.orderFront(None);
+        win.makeKeyAndOrderFront(None);
+        // 从其它应用切回来时也要能抢到前台（activateIgnoringOtherApps 已废弃）
+        if let Some(mtm) = objc2::MainThreadMarker::new() {
+            #[allow(deprecated)]
+            NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+        }
+        true
+    }
+
     // ── 系统派发的「打开文件」 ─────────────────────────────────────────────
     //
     // 用户在访达里双击、右键"打开方式 → iPlayer"、把文件拖到 Dock 图标上、
@@ -359,9 +388,19 @@ mod imp {
     pub fn own_bundle_id() -> Option<String> {
         None
     }
+
+    /// 非 macOS 没有"藏窗口"的必要（窗口关闭即进程结束）。
+    pub fn hide_window(_window: &Window) -> bool {
+        false
+    }
+
+    pub fn show_window(_window: &Window) -> bool {
+        false
+    }
 }
 
 pub use imp::{
-    async_sheet_available, default_handler_bundle_id, install_open_docs, is_fullscreen,
-    own_bundle_id, set_always_on_top, set_default_role_handler, take_open_doc, toggle_fullscreen,
+    async_sheet_available, default_handler_bundle_id, hide_window, install_open_docs,
+    is_fullscreen, own_bundle_id, set_always_on_top, set_default_role_handler, show_window,
+    take_open_doc, toggle_fullscreen,
 };
