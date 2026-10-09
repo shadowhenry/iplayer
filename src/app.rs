@@ -16,9 +16,10 @@ use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AppContext as _, Context, Div, Entity, ExternalPaths, FocusHandle, Focusable,
-    ImageSource, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, ObjectFit,
-    ParentElement as _, Render, RenderImage, SharedString, Stateful, StatefulInteractiveElement as _,
-    Styled as _, StyledImage as _, Subscription, Window, div, img, px, relative,
+    ImageSource, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ObjectFit, ParentElement as _, Render, RenderImage, SharedString, Stateful,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Window, div, img,
+    px, relative,
 };
 
 use crate::export::{self, Export};
@@ -89,6 +90,10 @@ pub(crate) const SCRUB_INTERVAL: Duration = Duration::from_millis(90);
 const WARMUP_FRAMES: u8 = 24;
 /// 提示条存活时长。
 const TOAST_TTL: Duration = Duration::from_secs(3);
+
+/// 图标弹框（角度 / 工具箱 / 字幕）的停靠时限：鼠标键盘都停住这么久就自己收起来
+/// （用户要求「10 秒后自动消失，而不是一直停靠」）。
+const PANEL_TTL: Duration = Duration::from_secs(10);
 /// 播放组四个按键（« / ▶ / » / ■）的图标统一尺寸 —— 取原来播放键的图标大小
 /// （44px 方框 × 0.55），避免小方框里的图标显得比播放键小一圈。
 // 控制条所有图标键共用这一个图标尺寸：播放组四键 + 右下角（静音/循环/截图）。
@@ -270,6 +275,9 @@ pub struct App {
     sub_size: usize,
     /// 已经弹出、正等用户选字幕文件的非阻塞面板
     sub_dialog: Option<PendingOpen>,
+    /// 三个图标弹框**最近一次有人碰**的时刻（开面板 / 点鼠标 / 按键都会刷新）。
+    /// 只有真有面板停靠着时才有意义；`tick` 拿它判 [`PANEL_TTL`] 超时自动收起。
+    panel_seen: Option<Instant>,
     toast: Option<(String, Instant)>,
     warmup: u8,
     /// 空舞台中央的品牌 logo（编译期嵌进二进制，打包不用带 assets/）
@@ -454,6 +462,7 @@ impl App {
             sub_panel: false,
             sub_size: 1,
             sub_dialog: None,
+            panel_seen: None,
             toast: None,
             warmup: 0,
             logo: load_logo(),
@@ -834,6 +843,37 @@ impl App {
             self.export_panel = false;
             self.sub_panel = false;
         }
+        self.arm_panel_timer();
+        cx.notify();
+    }
+
+    // ── 图标弹框的停靠超时 ──────────────────────────────────────────────
+
+    /// 现在有没有弹框停靠着。
+    fn panel_open(&self) -> bool {
+        self.orient_panel || self.export_panel || self.sub_panel
+    }
+
+    /// 开 / 关面板之后重新上表：还有面板停靠就从此刻重新计时，全关了就把表停下。
+    fn arm_panel_timer(&mut self) {
+        self.panel_seen = self.panel_open().then(Instant::now);
+    }
+
+    /// 有任何鼠标 / 键盘动作就叫一声，把「最近活动时刻」推到当前。
+    ///
+    /// 没有面板停靠时直接返回 —— 免得每次鼠标移动都往 App 里写一下。
+    fn note_activity(&mut self) {
+        if self.panel_open() {
+            self.panel_seen = Some(Instant::now());
+        }
+    }
+
+    /// 把三个弹框全收起来（停靠超时走这里；Esc 也复用）。
+    fn close_panels(&mut self, cx: &mut Context<Self>) {
+        self.orient_panel = false;
+        self.export_panel = false;
+        self.sub_panel = false;
+        self.panel_seen = None;
         cx.notify();
     }
 
@@ -876,6 +916,7 @@ impl App {
             self.orient_panel = false;
             self.sub_panel = false;
         }
+        self.arm_panel_timer();
         cx.notify();
     }
 
@@ -1044,6 +1085,7 @@ impl App {
             self.export_panel = false;
             self.orient_panel = false;
         }
+        self.arm_panel_timer();
         cx.notify();
     }
 
@@ -1200,6 +1242,27 @@ impl App {
             }
         }
 
+        // 图标弹框停靠超时：鼠标键盘都停住 `PANEL_TTL` 就自己收起来
+        //（用户要求：不要一直挂在右下角）。
+        // 面板开着时每帧续一次帧 —— 帧循环一停就没人来看表了（暂停播放、
+        // 没有媒体时尤其明显）。真正的"有没有人碰"由 `note_activity`
+        // 在鼠标 / 键盘事件里刷新，这里只负责判时间。
+        if self.panel_open() {
+            let now = Instant::now();
+            let seen = *self.panel_seen.get_or_insert(now);
+            // 两种情况先别收：
+            // ① 导出任务在跑 —— 面板是"强制显示"的（渲染条件里还有 export.is_some()），
+            //    收了又开，白白空转帧循环；
+            // ② 正挂着文件选择面板（保存 / 打开字幕）—— 用户此刻在跟系统 sheet 打交道，
+            //    应用窗口里当然没有鼠标动作，不代表他不用了。
+            let busy = self.export.is_some() || self.dialog.is_some() || self.sub_dialog.is_some();
+            if !busy && now.saturating_duration_since(seen) >= PANEL_TTL {
+                self.close_panels(cx);
+            } else {
+                window.request_animation_frame();
+            }
+        }
+
         // 保存面板（非阻塞 sheet）每帧轮询一次：用户选完就开跑，选完之前
         // 得一直要帧，否则帧循环一停结果就没人接。放在最前面，免得被后面的
         // 提前 return 跳过。
@@ -1214,6 +1277,9 @@ impl App {
                 }
                 Some(None) => cx.notify(), // 用户点了取消
             }
+            // 面板选择期间不算"没人用"（见下面停靠超时那一段），
+            // 一选完就从此刻重新计时，别让面板"选完就立刻消失"。
+            self.note_activity();
         }
 
         // 字幕的打开面板同理：每帧轮询一次，选完之前得一直要帧
@@ -1226,6 +1292,7 @@ impl App {
                 Some(Some(path)) => self.load_subtitle(path, cx),
                 Some(None) => cx.notify(),
             }
+            self.note_activity();
         }
 
         if self.warmup > 0 {
@@ -1254,6 +1321,8 @@ impl App {
         if let Some((result, dest, label)) = finished {
             // 落到这里说明线程已经收工，drop 里的 join 是即时的
             self.export = None;
+            // 任务跑着的时候面板不算"没人用"，收工后重新计时
+            self.note_activity();
             let name = dest
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
@@ -1368,16 +1437,12 @@ impl App {
             "]" => self.set_speed((self.speed + 0.5).min(3.0), cx),
             "m" => self.toggle_mute(window, cx),
             "escape" => {
-                if self.orient_panel {
-                    self.orient_panel = false;
-                } else if self.export_panel {
-                    self.export_panel = false;
-                } else if self.sub_panel {
-                    self.sub_panel = false;
+                if self.panel_open() {
+                    self.close_panels(cx);
                 } else {
                     self.sidebar = !self.sidebar;
+                    cx.notify();
                 }
-                cx.notify();
             }
             "p" if !m.control => self.step(-1, cx),
             "n" if !m.control => self.step(1, cx),
@@ -1996,6 +2061,8 @@ impl App {
         let pal = self.pal();
         // 视频 / 图片一律「保持比例、完整显示」：播放区多大就是多大，
         // 画面自己缩放进去，放不满的方向留黑边。Fill 会把画面拉变形，已弃用。
+        // （播放区容器本身**本来就贴窗口左右边缘** —— 用户看到的左右黑边
+        //   是画面比例留下的，不是布局留白；2026-10-09 用户确认不改。）
         let fit = ObjectFit::Contain;
         let frame = self.player.as_mut().and_then(|p| p.frame());
 
@@ -2980,8 +3047,15 @@ impl Render for App {
         let mut root = div()
             .track_focus(&focus)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                this.note_activity();
                 this.on_key(ev, window, cx)
             }))
+            // 有面板停靠时，**窗口里任何一次鼠标动作 / 点击**都算"还在用"，
+            // 把停靠超时的表重新拨到此刻（点哪儿都算，不只是点面板里）。
+            // 注意：GPUI 的事件分派里没被 occlude 的祖先也在 hover 链上，
+            // 所以挂在根节点上能收到全窗口的动作。
+            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, _| this.note_activity()))
+            .capture_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, _, _| this.note_activity()))
             // Dock 菜单「显示主界面」在窗口还"活跃"（只是被 orderOut 藏了）
             // 时走这条：把窗口亮回来。无活跃窗口时由 main.rs 里的全局监听兜住。
             .on_action(cx.listener(|_, _: &ShowMainWindow, window, cx| {
@@ -4879,5 +4953,184 @@ mod now_playing_tests {
             cx.debug_bounds("now-playing").is_none(),
             "视频舞台上不该出现音乐曲名那一层"
         );
+    }
+}
+
+/// 图标弹框（角度 / 工具箱 / 字幕）停靠超时的回归（用户要求
+/// 「鼠标停止点击 10s 后自动消失，而不是一直停靠」）：
+/// 到点自动收、没到点不动、有动作就重新计时。
+#[cfg(test)]
+mod panel_timeout_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+
+    use super::*;
+
+    fn harness(
+        cx: &mut TestAppContext,
+    ) -> (&mut VisualTestContext, Rc<RefCell<Option<Entity<App>>>>) {
+        cx.update(gpui_kit::init);
+        let held: Rc<RefCell<Option<Entity<App>>>> = Rc::new(RefCell::new(None));
+        let slot = held.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let app = App::new(window, cx);
+            *slot.borrow_mut() = Some(cx.entity());
+            app
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        (cx, held)
+    }
+
+    fn redraw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    /// 把"最近活动时刻"拨回 `secs` 秒前，模拟"这么久没人碰过"。
+    fn rewind(cx: &mut VisualTestContext, held: &Rc<RefCell<Option<Entity<App>>>>, secs: u64) {
+        let app = held.borrow().as_ref().expect("App 实体").clone();
+        app.update_in(cx, |view, _, _| {
+            view.panel_seen = Some(Instant::now() - Duration::from_secs(secs));
+        });
+    }
+
+    fn seen_age(cx: &mut VisualTestContext, held: &Rc<RefCell<Option<Entity<App>>>>) -> Option<f32> {
+        let app = held.borrow().as_ref().expect("App 实体").clone();
+        cx.update(|_, cx| {
+            app.read(cx)
+                .panel_seen
+                .map(|t| Instant::now().saturating_duration_since(t).as_secs_f32())
+        })
+    }
+
+    /// 三个面板各自的开关方法 + 面板选择器，一把梭测。
+    const KINDS: [(&str, fn(&mut App, &mut Context<App>)); 3] = [
+        ("orient-panel", |a, cx| a.toggle_orient_panel(cx)),
+        ("export-panel", |a, cx| a.toggle_export_panel(cx)),
+        ("sub-panel", |a, cx| a.toggle_sub_panel(cx)),
+    ];
+
+    fn open(cx: &mut VisualTestContext, held: &Rc<RefCell<Option<Entity<App>>>>, i: usize) -> &'static str {
+        let app = held.borrow().as_ref().expect("App 实体").clone();
+        app.update_in(cx, |view, _, cx| (KINDS[i].1)(view, cx));
+        redraw(cx);
+        KINDS[i].0
+    }
+
+    /// 停够 `PANEL_TTL` 就自己收 —— 三个面板都得认。
+    #[gpui::test]
+    fn every_panel_closes_after_the_idle_timeout(cx: &mut TestAppContext) {
+        for i in 0..KINDS.len() {
+            let (cx, held) = harness(cx);
+            let sel = open(cx, &held, i);
+            assert!(
+                cx.debug_bounds(sel).is_some(),
+                "{sel} 应当被渲染（刚点开）"
+            );
+
+            rewind(cx, &held, PANEL_TTL.as_secs() + 1);
+            redraw(cx);
+
+            assert!(
+                cx.debug_bounds(sel).is_none(),
+                "{sel} 停靠超过 {} 秒应当自动消失，不该一直挂着",
+                PANEL_TTL.as_secs()
+            );
+            let app = held.borrow().as_ref().expect("App 实体").clone();
+            let still_open = cx.update(|_, cx| app.read(cx).panel_open());
+            assert!(!still_open, "自动收起后三个面板标记都该是关的");
+            let age = seen_age(cx, &held);
+            assert_eq!(age, None, "全关之后计时表要停下（否则鼠标一动又记一笔）");
+        }
+    }
+
+    /// 还没到点不许提前收（否则就成"闪一下就没了"）。
+    #[gpui::test]
+    fn panel_survives_until_the_timeout(cx: &mut TestAppContext) {
+        let (cx, held) = harness(cx);
+        let sel = open(cx, &held, 1); // 工具箱
+
+        rewind(cx, &held, PANEL_TTL.as_secs() - 2);
+        redraw(cx);
+        assert!(
+            cx.debug_bounds(sel).is_some(),
+            "才过了 {} 秒，面板不该提前消失",
+            PANEL_TTL.as_secs() - 2
+        );
+    }
+
+    /// 鼠标一动就把表重新拨回此刻 —— 所以在用的人不会被打断。
+    #[gpui::test]
+    fn mouse_activity_postpones_the_timeout(cx: &mut TestAppContext) {
+        let (cx, held) = harness(cx);
+        let sel = open(cx, &held, 2); // 字幕面板
+
+        // 先假装已经停靠了 11 秒（再过一帧就会被收掉）……
+        rewind(cx, &held, PANEL_TTL.as_secs() + 1);
+        redraw(cx);
+        assert!(cx.debug_bounds(sel).is_none(), "先确认这个状态下确实会收");
+
+        // ……重新打开，拨到"马上到点"，然后动一下鼠标：应当又从头计时。
+        open(cx, &held, 2);
+        rewind(cx, &held, PANEL_TTL.as_secs() - 1);
+        cx.simulate_mouse_move(gpui::point(px(300.), px(300.)), None, Modifiers::default());
+        redraw(cx);
+
+        let age = seen_age(cx, &held).expect("面板还开着，计时表就得有值");
+        assert!(
+            age < 1.0,
+            "鼠标动作应当把停靠计时重新拨到此刻，实测还是 {age:.1}s 前"
+        );
+        assert!(
+            cx.debug_bounds(sel).is_some(),
+            "刚动过鼠标，面板不该消失"
+        );
+    }
+
+    /// 点窗口里任意一处也算动作（面板按钮之外的地方同样刷新）。
+    #[gpui::test]
+    fn any_click_counts_as_activity(cx: &mut TestAppContext) {
+        let (cx, held) = harness(cx);
+        open(cx, &held, 2);
+        rewind(cx, &held, PANEL_TTL.as_secs() - 1);
+
+        cx.simulate_click(gpui::point(px(300.), px(300.)), Modifiers::default());
+        redraw(cx);
+
+        let age = seen_age(cx, &held).expect("面板还开着，计时表就得有值");
+        assert!(age < 1.0, "点一下窗口应当重新计时，实测还是 {age:.1}s 前");
+    }
+
+    /// 手动关掉面板后计时表要停 —— 否则鼠标一动就重新记，白留一个历史值。
+    #[gpui::test]
+    fn closing_by_hand_stops_the_clock(cx: &mut TestAppContext) {
+        let (cx, held) = harness(cx);
+        let app = held.borrow().as_ref().expect("App 实体").clone();
+        open(cx, &held, 0);
+        assert!(seen_age(cx, &held).is_some(), "开着的时候得有计时");
+
+        app.update_in(cx, |view, _, cx| view.toggle_orient_panel(cx));
+        redraw(cx);
+        assert_eq!(seen_age(cx, &held), None, "手动关掉后计时表该停");
+    }
+
+    /// Esc 仍然是"先收面板"：面板开着时按一下只收面板，不顺手把侧栏也切了。
+    #[gpui::test]
+    fn escape_closes_the_panel_without_touching_the_sidebar(cx: &mut TestAppContext) {
+        let (cx, held) = harness(cx);
+        let app = held.borrow().as_ref().expect("App 实体").clone();
+        assert!(cx.update(|_, cx| app.read(cx).sidebar), "侧栏默认是展开的");
+
+        open(cx, &held, 1); // 工具箱
+        cx.simulate_keystrokes("escape");
+        redraw(cx);
+
+        assert!(
+            cx.debug_bounds("export-panel").is_none(),
+            "Esc 应当收起面板"
+        );
+        assert!(cx.update(|_, cx| app.read(cx).sidebar), "侧栏不该被一起切掉");
+        assert_eq!(seen_age(cx, &held), None, "Esc 收面板后计时表也该停");
     }
 }
