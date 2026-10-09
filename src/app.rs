@@ -812,21 +812,31 @@ impl App {
         cx.notify();
     }
 
-    /// 缩到 Dock（右上角那颗「最小化」）。点 Dock 图标会由
-    /// `show_window` 里的 deminiaturize 唤回来。
-    fn minimize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !native::minimize_window(window) {
-            self.toast("当前平台不支持最小化", cx);
-        }
+    /// 控制条最右端那颗「最大化」：点一下最大化，再点一下还原。
+    ///
+    /// **实现上必须借 GPUI 的 `Window::zoom_window()`**，不能自己顺着原生窗口
+    /// 句柄去同步调 AppKit 的 `zoom:` —— 同步调用的那一刻我们正处在 GPUI 的
+    /// 事件分发里（App 借用中），AppKit 立刻改窗口大小并回调 `set_frame_size`
+    /// → GPUI 想 `handle.update(…)` 做 `bounds_changed`，结果被 `.log_err()`
+    /// 悄悄吞掉，布局就停在旧尺寸上。表现就是用户报的
+    /// 「窗口变大了，但里面的播放区还是小的」。
+    /// GPUI 的这条路径内部把原生调用丢到前台执行器上稍后执行，回调回来时
+    /// 已经没人借用，布局才跟得上。
+    ///
+    /// 这条是**三个平台通用**的：macOS 走 `zoom:`、Linux 走窗口管理器最大化、
+    /// Windows 走 `SW_MAXIMIZE`（只有无头测试平台是 `unimplemented!()`）。
+    fn toggle_maximize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.zoom_window();
         cx.notify();
     }
 
-    /// 「最大化」= AppKit 的 zoom（与绿色交通灯同动作，再点一次还原）。
-    fn maximize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !native::zoom_window(window) {
-            self.toast("当前平台不支持最大化", cx);
-        }
-        cx.notify();
+    /// 「最大化」按钮的图标：没最大化 = 放大框，已最大化 = 还原的双层框。
+    ///
+    /// 状态直接读窗口的真实状态位（`native::is_window_zoomed`，即 AppKit 的
+    /// `isZoomed`），不自己存一份 —— 这样点绿色交通灯最大化之后按钮图标
+    /// 也会跟着变，不会出现"按钮说没最大化、窗口却是大的"。
+    fn maximize_glyph(zoomed: bool) -> &'static str {
+        if zoomed { "restore" } else { "maximize" }
     }
 
     // ── 画面角度 ────────────────────────────────────────────────────────
@@ -1814,11 +1824,12 @@ impl App {
                     .flex_none()
                     .items_center()
                     .gap(px(3.))
-                    // 右上角这一排，用户指定的顺序（从左到右）：
-                    // 深浅色 · 置顶 · 最小化 · 最大化 · 关闭。
-                    // 原先挤在这里的画面角度 / 工具箱 / 全屏挪到了底部控制条
-                    // （截图按钮右侧），「链条」（设默认播放器）图标整个去掉 ——
-                    // 功能保留在快捷键 ⌘D 和 `iplayer --set-default`。
+                    // 右上角这一排，用户指定的顺序（从左到右）：深浅色 · 置顶。
+                    // 最小化 / 最大化 / 关闭三颗已按用户要求整个移除 —— 这三件事
+                    // 交给 macOS 自带的红绿灯（左上角那三颗）就够了；关窗走 ⌘W。
+                    // 原先挤在这里的画面角度 / 工具箱 / 全屏挪到了底部控制条，
+                    // 「链条」（设默认播放器）图标整个去掉 —— 功能保留在快捷键
+                    // ⌘D 和 `iplayer --set-default`。
                     .child(
                         self.icon_btn("tb-theme", if self.dark { "sun" } else { "moon" }, 26.)
                             .debug_selector(|| "tb-theme".to_string())
@@ -1831,23 +1842,6 @@ impl App {
                         self.icon_btn_c("tb-pin", "pin", 26., self.tb_color(self.pinned), self.pinned)
                             .debug_selector(|| "tb-pin".to_string())
                             .on_click(cx.listener(|this, _, window, cx| this.toggle_pin(window, cx))),
-                    )
-                    .child(
-                        self.icon_btn("tb-min", "minimize", 26.)
-                            .debug_selector(|| "tb-min".to_string())
-                            .on_click(cx.listener(|this, _, window, cx| this.minimize(window, cx))),
-                    )
-                    .child(
-                        self.icon_btn("tb-max", "maximize", 26.)
-                            .debug_selector(|| "tb-max".to_string())
-                            .on_click(cx.listener(|this, _, window, cx| this.maximize(window, cx))),
-                    )
-                    // 最右侧的 X：退出整个应用（与 main.rs 的 on_window_closed 行为
-                    // 一致 —— 窗口没了就退，Dock 里不会留下点不动的僵尸图标）
-                    .child(
-                        self.icon_btn("tb-close", "close", 26.)
-                            .debug_selector(|| "tb-close".to_string())
-                            .on_click(cx.listener(|_, _, _, cx| cx.quit())),
                     ),
             )
     }
@@ -2725,7 +2719,7 @@ impl App {
         .into_any_element()
     }
 
-    fn render_controls(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let pal = self.pal();
         let (pos, dur) = match &self.player {
             Some(p) => (p.position(), p.duration()),
@@ -2852,9 +2846,9 @@ impl App {
             )
             // 「信息」按钮已按用户要求从控制条去掉；浮层仍可用快捷键 i 开关。
             // 「截图」按钮也去掉了 —— 工具箱面板里本来就有这一项（少一颗重复按钮）。
-            // 循环右边这组"画面工具"（用户指定）：切换方向 · 工具箱。
-            // 原先都在标题栏右上角，那一片现在只留窗口类操作
-            // （置顶 / 深浅色 / 最小化 / 最大化 / 关闭）。全屏没有再给按钮 ——
+            // 循环右边这组"画面 / 窗口工具"（用户指定）：切换方向 · 字幕 · 工具箱 · 最大化。
+            // 前三个原先都在标题栏右上角，那一片现在只剩窗口开关类（深浅色 · 置顶；
+            // 最小化 / 关闭交给 macOS 红绿灯）。全屏没有再给按钮 ——
             // 绿色交通灯和快捷键 ⌘F 都还在。开关态照旧靠底色高亮，不用暗色。
             .child(
                 self.icon_btn_sz(
@@ -2885,7 +2879,25 @@ impl App {
                 self.icon_btn_sz("ctl-export", "toolbox", 36., PLAY_ICON, pal.text(), self.export_panel)
                     .debug_selector(|| "ctl-export".to_string())
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_export_panel(cx))),
-            );
+            )
+            // 最右端（用户要求「右下角增加一个最大化的图标」）：点一下最大化、
+            // 再点一下还原。图标按窗口真实状态位切换（`isZoomed`），所以点绿色
+            // 交通灯最大化之后这里也会同步变成「还原」的样子。
+            // 注意走的是 GPUI 的 `Window::zoom_window()`（异步），
+            // 千万别改成同步调 AppKit —— 原因见 `toggle_maximize` 的注释。
+            .child({
+                let zoomed = native::is_window_zoomed(window);
+                self.icon_btn_sz(
+                    "ctl-max",
+                    Self::maximize_glyph(zoomed),
+                    36.,
+                    PLAY_ICON,
+                    pal.text(),
+                    zoomed,
+                )
+                .debug_selector(|| "ctl-max".to_string())
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_maximize(window, cx)))
+            });
 
         // 右组永远套一个跟左侧时间区等宽的 `1fr`，左右一配对，
         // 中间的播放组就固定落在整行正中 —— 不再随侧栏折叠换位置。
@@ -3041,7 +3053,7 @@ impl Render for App {
             None
         };
         let titlebar = self.render_titlebar(cx);
-        let controls = self.render_controls(cx);
+        let controls = self.render_controls(window, cx);
         let focus = self.focus.clone();
 
         let mut root = div()
@@ -4568,9 +4580,10 @@ mod subtitle_tests {
 }
 
 /// 标题栏 / 控制条按钮排布的回归（用户明确指定的位置）：
-/// 右上角从左到右 = 深浅色 · 置顶 · 最小化 · 最大化 · 关闭；
-/// 循环右侧 = 切换方向 · 字幕 · 工具箱；「链条」（设默认播放器）与「截图」图标去掉
-/// （后者在工具箱面板里有入口）。全屏不再给按钮：绿色交通灯 + 快捷键 ⌘F 仍在。
+/// 右上角从左到右 = 深浅色 · 置顶（最小化 / 最大化 / 关闭交给系统红绿灯）；
+/// 循环右侧 = 切换方向 · 字幕 · 工具箱 · 最大化；「链条」（设默认播放器）与
+/// 「截图」图标去掉（后者在工具箱面板里有入口）。全屏不再给按钮：
+/// 绿色交通灯 + 快捷键 ⌘F 仍在。
 #[cfg(test)]
 mod toolbar_tests {
     use std::cell::RefCell;
@@ -4603,12 +4616,12 @@ mod toolbar_tests {
         cx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel} 应当被渲染"))
     }
 
-    /// 右上角这一排的成员与顺序。
+    /// 右上角这一排的成员与顺序：只剩 深浅色 · 置顶 两颗。
     #[gpui::test]
     fn titlebar_right_cluster_order(cx: &mut TestAppContext) {
         let (cx, _held) = harness(cx);
 
-        let order = ["tb-theme", "tb-pin", "tb-min", "tb-max", "tb-close"];
+        let order = ["tb-theme", "tb-pin"];
         let mut prev: Option<gpui::Bounds<Pixels>> = None;
         for sel in order {
             let b = bounds(cx, sel);
@@ -4629,6 +4642,15 @@ mod toolbar_tests {
                 "{gone} 不应该再被渲染（已挪到控制条 / 已删除）"
             );
         }
+
+        // 最小化 / 最大化 / 关闭三颗已按用户要求整个移除：
+        // 窗口这三件事交给 macOS 自带的红绿灯（左上角），别再长回去。
+        for gone in ["tb-min", "tb-max", "tb-close"] {
+            assert!(
+                cx.debug_bounds(gone).is_none(),
+                "{gone} 应当已从标题栏移除（用户要求：交给系统红绿灯）"
+            );
+        }
     }
 
     /// 底部控制条：循环右侧依次是 切换方向 · 字幕 · 工具箱，同一行、与循环键同尺寸。
@@ -4642,9 +4664,10 @@ mod toolbar_tests {
             "控制条上的截图按钮应当已移除"
         );
 
-        // 字幕按钮（用户要求）夹在「切换方向」和「工具箱」中间
+        // 字幕按钮（用户要求）夹在「切换方向」和「工具箱」中间；
+        // 最右端是「最大化」（用户要求：右下角增加一个最大化图标）
         let loop_btn = bounds(cx, "loop");
-        let order = ["ctl-orient", "ctl-sub", "ctl-export"];
+        let order = ["ctl-orient", "ctl-sub", "ctl-export", "ctl-max"];
         let mut prev = loop_btn;
         for sel in order {
             let b = bounds(cx, sel);
@@ -4657,7 +4680,7 @@ mod toolbar_tests {
 
         // 工具按钮与循环键同尺寸（同一排工具，不要忽大忽小）
         let loop_b = bounds(cx, "loop");
-        for sel in ["ctl-orient", "ctl-sub", "ctl-export"] {
+        for sel in ["ctl-orient", "ctl-sub", "ctl-export", "ctl-max"] {
             let b = bounds(cx, sel);
             let diff = (n(b.size.width) - n(loop_b.size.width)).abs();
             assert!(diff < 1.0, "{sel} 应当与循环键同宽，差 {diff:.1}px");
@@ -4672,6 +4695,88 @@ mod toolbar_tests {
             "工具组应当贴近行尾：行宽 {:.0}，最后一颗中心离行尾 {:.0}px",
             n(row.size.width),
             right_edge - last
+        );
+    }
+
+    /// 「最大化」按钮的两种图标形态：没最大化是方框，最大化后是还原的双层框。
+    #[test]
+    fn maximize_glyph_follows_the_window_state() {
+        assert_eq!(App::maximize_glyph(false), "maximize", "未最大化时应当是放大框");
+        assert_eq!(App::maximize_glyph(true), "restore", "已最大化时应当是还原形态");
+        // 两个名字都得在图标集里真存在（写错名字要到运行时才 panic）
+        for name in [App::maximize_glyph(false), App::maximize_glyph(true)] {
+            assert!(icons::source(name).is_some(), "图标集里没有 {name}");
+        }
+    }
+
+    /// 点「最大化」的动作**无头测不了**：测试平台的 `PlatformWindow::zoom()`
+    /// 是 `unimplemented!()`（`gpui-pre` 的 `platform/test/window.rs:451`），
+    /// 三个真平台反而都实现了（macOS `zoom:` / Wayland、X11 最大化 / Windows
+    /// `SW_MAXIMIZE`）。所以这里只钉两件能在无头环境里钉的事：
+    /// 状态查询不炸、按钮真接上了动作。真机上的行为靠 GUI 冒烟截图核对。
+    #[gpui::test]
+    fn maximize_button_is_wired_and_state_read_is_safe(cx: &mut TestAppContext) {
+        let (cx, _held) = harness(cx);
+
+        // 无头平台没有原生窗口：状态查询要老老实实返回 false，而不是炸
+        assert!(
+            !cx.update(|window, _| native::is_window_zoomed(window)),
+            "无头测试里没有 NSWindow，状态位应当为 false"
+        );
+
+        // 按钮画出来了，而且真的接上了动作（不是个好看的摆设）
+        assert!(cx.debug_bounds("ctl-max").is_some(), "ctl-max 应当被渲染");
+        let src = include_str!("app.rs");
+        let at = src.find("\"ctl-max\"").expect("控制条上应当有 ctl-max");
+        let tail = &src[at..(at + 900).min(src.len())];
+        assert!(
+            tail.contains(&concat!("this.toggle_maxi", "mize(window, cx)")),
+            "ctl-max 的点击回调应当调 toggle_maximize"
+        );
+    }
+
+    /// 「最大化」必须走 GPUI 的**异步**路径（`Window::zoom_window()`）。
+    ///
+    /// 踩过的坑：在点击回调里同步调 AppKit 的缩放 —— 那一刻 App 正被借用，
+    /// AppKit 改完窗口尺寸回调 `set_frame_size`，GPUI 的 `bounds_changed` 被
+    /// `.log_err()` 悄悄吞掉，于是「窗口变大了，但里面的播放区还是小的」。
+    /// 这条测试盯住 `toggle_maximize` 只用 GPUI 那条异步路径，且不碰 `native::`
+    ///（读窗口状态是渲染路径的事，不在这个函数里）。
+    #[test]
+    fn maximize_goes_through_the_async_gpui_path() {
+        let src = include_str!("app.rs");
+        let sig = "    fn toggle_maximize(";
+        let start = src.find(sig).expect("toggle_maximize 应当存在");
+        let rest = &src[start + 1..];
+        let end = match rest.find("\n    fn ") {
+            Some(i) => start + 1 + i,
+            None => src.len(),
+        };
+        let body = &src[start..end];
+        // 只扫代码：注释里出现关键词（比如解释"为什么不能用 native"）不算违规
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // 拼出来是为了让"要扫的字符串"不出现在这条测试自己的源码里
+        let ok = concat!("window.zoom_", "window()");
+        assert!(
+            code.contains(ok),
+            "toggle_maximize 应当调 {ok}（GPUI 内部把 AppKit 调用丢到前台执行器上，异步才安全）"
+        );
+        assert!(
+            !code.contains("native::"),
+            "toggle_maximize 里不该出现 native:: —— 同步调 AppKit 会让布局卡在旧尺寸"
+        );
+
+        // native 里也不许再有"同步 zoom"这种手艺活儿
+        let native_src = include_str!("native.rs");
+        let sync_zoom = concat!("win.zoom", "(");
+        assert!(
+            !native_src.contains(sync_zoom),
+            "native.rs 里不该再有同步的 AppKit 缩放调用（{sync_zoom}）"
         );
     }
 }

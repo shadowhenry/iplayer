@@ -1,9 +1,14 @@
-//! 窗口的平台级开关：**全屏** / **窗口置顶** / **最小化 / 最大化** /
+//! 窗口的平台级开关：**全屏** / **窗口置顶** / **最大化状态查询** /
 //! **接收系统派发的"打开文件"** / **设为默认播放器**。
 //!
-//! GPUI 把前两件事藏在 `PlatformWindow` 里（`toggle_fullscreen` 有，但那个
-//! trait 对象是 crate 私有的，`Window` 没有透出来），所以这里顺着
-//! `raw-window-handle` 拿到 macOS 的 `NSView`，再用 objc2 操作它的 `NSWindow`。
+//! GPUI 把「全屏」藏在 `PlatformWindow` 里（那个 trait 对象是 crate 私有的，
+//! `Window` 没有透出来），所以这里顺着 `raw-window-handle` 拿到 macOS 的
+//! `NSView`，再用 objc2 操作它的 `NSWindow`。
+//!
+//! **注意**：改窗口尺寸（最大化 / 还原）**不要**在这里同步调 AppKit ——
+//! 见 `toggle_maximize` 的注释：同步调用会把 GPUI 的 resize 通知吞掉，
+//! 表现是"窗口变大了但里面的画面还是小的"。这里只做"读状态"和
+//! "不影响布局的开关"（全屏 / 置顶 / 藏窗口）。
 //!
 //! 非 macOS 平台一律返回 `false` / `None`，调用方据此提示"当前平台不支持"。
 
@@ -90,23 +95,14 @@ mod imp {
         true
     }
 
-    /// 缩到 Dock（右上角那颗「最小化」）。
-    pub fn minimize_window(window: &Window) -> bool {
-        let Some(win) = ns_window(window) else {
-            return false;
-        };
-        win.miniaturize(None);
-        true
-    }
-
-    /// 「最大化」= AppKit 的 zoom：在"用户摆的尺寸"和"屏幕可用尺寸"之间切换，
-    /// 再点一次就还原 —— 和绿色交通灯按钮是同一个动作。
-    pub fn zoom_window(window: &Window) -> bool {
-        let Some(win) = ns_window(window) else {
-            return false;
-        };
-        win.zoom(None);
-        true
+    /// 窗口现在是不是"最大化（zoom）"状态 —— 和绿色交通灯同一个状态位。
+    ///
+    /// 只读，不碰布局，可以放心在渲染 / 回调里调。按钮的图标按它切换
+    ///（放大 ↔ 还原），所以点绿灯最大化之后按钮也会跟着变，不用自己记状态。
+    pub fn is_window_zoomed(window: &Window) -> bool {
+        ns_window(window)
+            .map(|w| w.isZoomed())
+            .unwrap_or(false)
     }
 
     /// 把窗口**藏起来**而不是关掉（红绿灯关闭走这条）。
@@ -392,11 +388,8 @@ mod imp {
         false
     }
 
-    pub fn minimize_window(_window: &Window) -> bool {
-        false
-    }
-
-    pub fn zoom_window(_window: &Window) -> bool {
+    /// 别的平台没有 AppKit 的 zoom 状态位（最大化走各自的窗口管理器）。
+    pub fn is_window_zoomed(_window: &Window) -> bool {
         false
     }
 
@@ -432,6 +425,6 @@ mod imp {
 
 pub use imp::{
     async_sheet_available, default_handler_bundle_id, hide_window, install_open_docs,
-    is_fullscreen, minimize_window, own_bundle_id, set_always_on_top, set_default_role_handler,
-    show_window, take_open_doc, toggle_fullscreen, zoom_window,
+    is_fullscreen, is_window_zoomed, own_bundle_id, set_always_on_top, set_default_role_handler,
+    show_window, take_open_doc, toggle_fullscreen,
 };

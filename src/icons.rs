@@ -71,10 +71,16 @@ pub fn source(name: &str) -> Option<String> {
         // 字幕（控制条「工具箱」左侧那颗）：一块圆角"画面" + 底部两条短横线
         //（两条线刻意下移、居中，与 gif 的字母造型、image 的几何图案都不同）
         "captions" => s("<rect x=\"2.5\" y=\"4.5\" width=\"19\" height=\"15\" rx=\"2.5\"/><path d=\"M7.5 14h4\"/><path d=\"M13.5 14h3\"/>"),
-        // 窗口最小化 / 最大化：一条横线、一个圆角方框（线宽与 X / 减号一致，
-        // 方框取 15/24 —— 比满格的 18/24 秀气，和旁边一排字重对得上）
-        "minimize" => s("<path d=\"M5 12h14\"/>"),
+        // 窗口最大化 / 还原（控制条最右端那颗，用户要求）：
+        // 最大化 = 一个圆角方框；已最大化时换成"两层方框"的还原造型
+        //（后层只画露出来的那一半，19px 下两层仍分得清）。
+        // 两颗的视觉体量刻意配平：maximize 占 4.5–19.5，restore 占 2.8–20。
         "maximize" => s("<rect x=\"4.5\" y=\"4.5\" width=\"15\" height=\"15\" rx=\"2.2\"/>"),
+        "restore" => s("<rect x=\"8.5\" y=\"8.5\" width=\"11.5\" height=\"11.5\" rx=\"2.4\"/><path d=\"M5 16.5A2.2 2.2 0 0 1 2.8 14.3V5A2.2 2.2 0 0 1 5 2.8h8.8A2.2 2.2 0 0 1 16 5\"/>"),
+        // 最小化那颗曾挂在标题栏右上角，已按用户要求整个移除 —— 形状定义
+        // 一并删掉，免得留下没人引用的死图标；而且标题栏那两颗（最小化/
+        // 关闭）现在交给 macOS 自带的红绿灯。剩下的 "close" 是侧栏
+        // 「清空列表」在用的，必须保留。
         "close" => s("<path d=\"M18 6 6 18\"/><path d=\"m6 6 12 12\"/>"),
         _ => return None,
     })
@@ -86,7 +92,7 @@ pub const ALL: &[&str] = &[
     "panelLeft", "pin", "sun", "moon", "folder", "film", "refresh", "search",
     "play", "pause", "prev", "next", "stop", "volume", "volumeX", "info",
     "loop", "loop1", "camera", "toolbox", "gif", "expand", "music",
-    "image", "download", "crop", "rotate", "captions", "minimize", "maximize", "close",
+    "image", "download", "crop", "rotate", "captions", "maximize", "restore", "close",
 ];
 
 type Cache = HashMap<(String, u32, String), Arc<RenderImage>>;
@@ -166,6 +172,23 @@ mod tests {
         assert!(
             one_src.starts_with(&loop_src) || one_src.contains("v3.8"),
             "单曲循环应当是环形箭头 + 中心 \"1\""
+        );
+    }
+
+    /// 「最小化」形状应当彻底消失（标题栏那三颗交给系统红绿灯；控制条只留
+    /// 最大化/还原）；`close` 得留着：侧栏「清空列表」还在用同一个 X。
+    /// 最大化 / 还原这对必须是两个不同形状，否则按钮看不出状态。
+    #[test]
+    fn window_control_glyphs() {
+        assert!(source("minimize").is_none(), "minimize 图标应当已随按钮移除");
+        assert!(source("close").is_some(), "close 图标仍被侧栏「清空列表」使用");
+
+        let max = source("maximize").expect("最大化图标应当存在（控制条最右端）");
+        let restore = source("restore").expect("还原图标应当存在");
+        assert_ne!(max, restore, "最大化与还原不能共用同一个形状");
+        assert!(
+            restore.matches("<rect").count() == 1,
+            "还原图标应当只有一层实心方框 + 一层只画半边，实际：{restore}"
         );
     }
 

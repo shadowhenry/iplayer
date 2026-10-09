@@ -60,8 +60,23 @@
   控制条无顶部分隔线；播放组始终整行居中（左右各一个 1fr 槽配对）。
   舞台容器本身已贴窗口左右边缘（逐像素核对过）；用户看到的左右黑边是画面比例留下的，
   2026-10-09 用户确认**不改**。真要贴边只有 Cover 一条路（裁掉超出方向），别再动。
-- 按钮排布：标题栏右上角 = 深浅色 · 置顶 · 最小化 · 最大化 · 关闭X；
-  控制条右端 = 静音 · 音量 · 倍速 · 循环 · 切换方向 · 字幕 · 工具箱。
+- 按钮排布：标题栏右上角 = 深浅色 · 置顶（**最小化 / 最大化 / 关闭X 三颗已按用户要求整个移除**，
+  这三件事交给 macOS 红绿灯；`native::minimize_window`/`zoom_window` 和 `minimize`/`maximize`
+  图标定义也随之删了，有测试钉住别长回来）；
+  控制条右端 = 静音 · 音量 · 倍速 · 循环 · 切换方向 · 字幕 · 工具箱 · **最大化**（点一下铺满
+  屏、再点还原；图标随 `native::is_window_zoomed`（AppKit isZoomed）在 maximize/restore 间切，
+  不自己存状态，点绿灯也能同步）。
+
+## 最大化 / 改窗口尺寸的坑（勿回退）
+- **绝不能在事件回调里同步调 AppKit 改窗口尺寸**（如 `NSWindow.zoom:`）：那一刻 App 正被借用，
+  AppKit 改完尺寸回调 `set_frame_size`（gpui-pre-macos window.rs:3253，被 swizzle 的 setFrameSize:），
+  GPUI 的 `bounds_changed` 走 `handle.update(…).log_err()` 被吞 → 布局停在旧尺寸，
+  表现就是用户报的「窗口大了、播放区还是小的」。
+- 正解：`window.zoom_window()`（GPUI 自己的 API，内部把原生调用丢到前台执行器稍后执行）。
+  三个真平台都实现了 zoom；只有**无头测试平台是 `unimplemented!()`**（platform/test/window.rs:451），
+  所以无头测试点不了最大化按钮，只钉了源码扫描（必须 `window.zoom_window()`、禁 `native::`、
+  native.rs 禁同步 `win.zoom(`）+ 图标映射 + 几何。真机行为靠临时 `IPLAYER_DEMO_ZOOM` 帧计数
+  诊断开关截图验证过（最大化/还原都正常），验证完已删。
 - 图标分工：循环 = 环形箭头 `loop`/`loop1`（单曲带中心 "1"）；画面角度 = 方框+内部弧箭头 `rotate`；
   字幕 = `captions`（圆角框 + 两条短横线）。旧 `repeat`/`repeat1` 已删（有测试钉住）。
 - 角度面板 / 导出面板 / 字幕面板都在舞台右下角（`right/bottom 12px`），三者互斥不叠。
