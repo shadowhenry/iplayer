@@ -19,13 +19,11 @@ mod imp {
 
     use gpui_kit::Window;
     use objc2::rc::Retained;
-    use objc2::runtime::{AnyObject, ClassBuilder, NSObject, Sel};
-    use objc2::{ClassType, msg_send, sel};
     use objc2_app_kit::{
         NSApplication, NSFloatingWindowLevel, NSNormalWindowLevel, NSView, NSWindow,
         NSWindowCollectionBehavior, NSWindowStyleMask,
     };
-    use objc2_foundation::{NSAppleEventDescriptor, NSAppleEventManager, NSBundle};
+    use objc2_foundation::{NSBundle, NSURL};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
     /// 从 GPUI 的窗口摸到背后的 `NSWindow`。
@@ -145,109 +143,83 @@ mod imp {
     // （事件类 `aevt`、事件 ID `odoc`），**文件路径不会出现在 argv 里** ——
     // 实测 `open -a` 起来的进程 argv 是空的，所以光有 Info.plist 的文档类型声明
     // 是没用的：系统认得这个播放器，双击却什么都不会发生。
-    // gpui-pre-macos 不处理这条事件，于是自己挂一个处理器。
-
-    /// FourCC（`aevt` 这种四字符码）打包成 Apple Event 用的 OSType。
-    const fn four_cc(b: [u8; 4]) -> u32 {
-        u32::from_be_bytes(b)
-    }
-    /// 事件类 / 事件 ID：`aevt` + `odoc` = "请打开这些文档"。
-    const AE_OPEN_DOCS_CLASS: u32 = four_cc(*b"aevt");
-    const AE_OPEN_DOCS_ID: u32 = four_cc(*b"odoc");
-    /// 事件参数里装文件列表的那个键：`----`（AppleScript 里的 keyDirectObject）。
-    const KEY_DIRECT_OBJECT: u32 = four_cc(*b"----");
+    //
+    // ⚠️ **别自己往 `NSAppleEventManager` 上挂 aevt/odoc 处理器**（这里踩过）：
+    // AppKit 在 `-finishLaunching` 里会给同一对 (class, id) 装上它**自己的**
+    // 处理器，把我们抢先注册的那份覆盖掉 —— 而它随后把事件交给应用委托的
+    // `application:openURLs:`。所以接法是走 gpui 透出来的那个口子
+    //（`main.rs` 里 `application.on_open_urls(...)`，见 [`open_urls`]）。
+    //
+    // 两件事是分开的：
+    //   ① 事件 -> 队列：这里是主线程的 Apple Event 分发，**没有任何 GPUI
+    //      上下文**（连 `&mut App` 都拿不到），只负责把路径排进队列；
+    //   ② 队列 -> 播放：由 UI 侧取件（`App::pump_open_docs`）。
 
     /// 收下来的待打开文件。事件在主线程的 Apple Event 分发里到达，
-    /// 主循环每帧取一次。
+    /// UI 那边每帧取一次（帧循环停着的时候由 `App::watch_open_docs` 去取）。
     static OPEN_DOCS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
 
     fn open_docs() -> &'static Mutex<Vec<PathBuf>> {
         OPEN_DOCS.get_or_init(|| Mutex::new(Vec::new()))
     }
 
-    /// Apple Event 处理器本体：从事件里把文件 URL 抠出来排进队列。
+    /// 叫醒 UI 的通道。事件到达那一刻我们只有一堆路径、没法让它重绘，
+    /// 所以只"拍一下"；真正取件的是 [`App::watch_open_docs`]。
     ///
-    /// 选择子是 `handleEvent:withReplyEvent:`（AppleEventManager 约定）。
-    extern "C-unwind" fn handle_open_docs(
-        _this: &AnyObject,
-        _cmd: Sel,
-        event: &NSAppleEventDescriptor,
-        _reply: &NSAppleEventDescriptor,
-    ) {
-        // `paramDescriptorForKeyword:` 在 objc2-foundation 里被 objc2-core-services
-        // 门控着（我们没引那个 crate），直接发消息绕过类型绑定。
-        let list: Option<Retained<NSAppleEventDescriptor>> = unsafe {
-            msg_send![event, paramDescriptorForKeyword: KEY_DIRECT_OBJECT]
-        };
-        let Some(list) = list else {
+    /// 为什么要叫醒：帧循环是**按需**的，没有媒体、没有面板时 `tick` 一进来就
+    /// 返回，没人再要下一帧 —— 队列里躺着文件也只是躺着（用户看到的就是
+    /// "应用起来了，但不播、左侧列表也是空的"）。
+    static OPEN_DOC_WAKE: OnceLock<smol::channel::Sender<()>> = OnceLock::new();
+
+    /// 通道的接收端，交给 `App::watch_open_docs` 常驻等信号。
+    pub type OpenDocWake = smol::channel::Receiver<()>;
+
+    /// 接上唤醒通道（在 `run` 之前调一次）。
+    pub fn set_open_doc_wake(tx: smol::channel::Sender<()>) {
+        let _ = OPEN_DOC_WAKE.set(tx);
+    }
+
+    /// 排进队列 + 拍一下 UI。
+    fn push_paths(paths: Vec<PathBuf>) {
+        if paths.is_empty() {
             return;
-        };
-        let mut got: Vec<PathBuf> = Vec::new();
-        // 描述符列表是 1-based
-        for i in 1..=list.numberOfItems() {
-            let Some(item) = list.descriptorAtIndex(i) else {
-                continue;
-            };
-            // `fileURLValue` 会把 typeFileURL / typeAlias / typeFSRef **都**归一化，
-            // 比自己去 data 里抠字节靠谱（老发送方给的是 alias）。
-            let Some(url) = item.fileURLValue() else {
-                continue;
-            };
-            let Some(path) = url.path() else {
-                continue;
-            };
-            got.push(PathBuf::from(path.to_string()));
         }
-        if !got.is_empty() {
-            if let Ok(mut queue) = open_docs().lock() {
-                queue.extend(got);
-            }
+        if let Ok(mut queue) = open_docs().lock() {
+            queue.extend(paths);
+        }
+        if let Some(tx) = OPEN_DOC_WAKE.get() {
+            // 满了 / 没人接都无所谓：队列才是事实来源，UI 取完会再看一眼
+            let _ = tx.try_send(());
         }
     }
 
-    /// 挂上「打开文档」事件处理器。**必须在应用跑起来之前调**：事件是在
-    /// `didFinishLaunching` 之后才到的，但处理器得先挂好，否则第一次双击
-    /// 打开的那份文件就丢了。
-    pub fn install_open_docs() {
-        // 处理器只注册一次；类也只建一次（同一个类名不能重复注册）。
-        // 存裸地址而不是 `Retained`：objc 对象不是 `Sync`，而静态量必须是。
-        // 这个对象要活到进程结束，所以故意不回收。
-        static HANDLER: OnceLock<usize> = OnceLock::new();
-        let addr = *HANDLER.get_or_init(|| {
-            // AppleEventManager 只认"对象 + 选择子"，没有 C 回调那种用法，
-            // 所以现造一个只带这一个方法的类。
-            let mut builder = ClassBuilder::new(c"IPlayerOpenDocsHandler", NSObject::class())
-                .expect("IPlayerOpenDocsHandler 只会注册一次");
-            // SAFETY: 方法签名的编码就是 handler 的实际签名（见其定义）。
-            unsafe {
-                builder.add_method(
-                    sel!(handleEvent:withReplyEvent:),
-                    handle_open_docs as extern "C-unwind" fn(_, _, _, _),
-                );
+    /// 应用委托 `application:openURLs:` 送来的 `file://` URL 列表。
+    ///
+    /// gpui-pre 透出来的是 `NSURL.absoluteString`，也就是**百分号编码**过的
+    /// 字符串（路径里有空格 / 中文都会变成 `%20`、`%E4%B8%AD`），自己抠前缀
+    /// 再解码容易出错 —— 交给 Foundation 解回本地路径。
+    pub fn open_urls(urls: Vec<String>) {
+        let mut got: Vec<PathBuf> = Vec::with_capacity(urls.len());
+        for u in urls {
+            let s = objc2_foundation::NSString::from_str(&u);
+            let Some(url) = NSURL::URLWithString(&s) else {
+                continue;
+            };
+            // 只认本地文件：我们没注册任何 URL scheme；而且 `URLWithString`
+            // 对"not-a-url"这种相对字符串也会给出一个 URL，不挡一下就会把
+            // 垃圾路径塞进播放列表。
+            if !url.isFileURL() {
+                continue;
             }
-            let cls = builder.register();
-            let handler: Retained<AnyObject> = unsafe { msg_send![cls, new] };
-            Retained::into_raw(handler) as usize
-        });
-
-        // SAFETY: 上面存的就是这个对象的地址，且它永不释放。
-        let handler: &AnyObject = unsafe { &*(addr as *const AnyObject) };
-
-        // SAFETY: `handler` 上有 `handleEvent:withReplyEvent:` 这个方法，
-        // 且注册后它一直活着（存在 HANDLER 里）。
-        unsafe {
-            let manager = NSAppleEventManager::sharedAppleEventManager();
-            let _: () = msg_send![
-                &manager,
-                setEventHandler: handler,
-                andSelector: sel!(handleEvent:withReplyEvent:),
-                forEventClass: AE_OPEN_DOCS_CLASS,
-                andEventID: AE_OPEN_DOCS_ID,
-            ];
+            let Some(path) = url.to_file_path() else {
+                continue;
+            };
+            got.push(path);
         }
+        push_paths(got);
     }
 
-    /// 取走一个待打开的文件（主循环每帧问一次）。
+    /// 取走一个待打开的文件（UI 每帧 / 每次被拍到时问一次）。
     pub fn take_open_doc() -> Option<PathBuf> {
         let mut queue = open_docs().lock().ok()?;
         if queue.is_empty() {
@@ -393,8 +365,15 @@ mod imp {
         false
     }
 
-    /// 别的平台没有 Apple Event 那套"打开文档"，命令行参数就是全部入口。
-    pub fn install_open_docs() {}
+    /// 别的平台把要打开的文件放在命令行参数里（`main` 那边已经处理了），
+    /// 没有 Apple Event 那套东西，这个口子永远是空的。
+    pub fn open_urls(_urls: Vec<String>) {}
+
+    /// 同上：没有事件可等，唤醒通道只是为了让 `App::watch_open_docs`
+    /// 的类型在两边一致（它会安安静静睡到进程结束）。
+    pub type OpenDocWake = smol::channel::Receiver<()>;
+
+    pub fn set_open_doc_wake(_tx: smol::channel::Sender<()>) {}
 
     pub fn take_open_doc() -> Option<PathBuf> {
         None
@@ -424,7 +403,7 @@ mod imp {
 }
 
 pub use imp::{
-    async_sheet_available, default_handler_bundle_id, hide_window, install_open_docs,
-    is_fullscreen, is_window_zoomed, own_bundle_id, set_always_on_top, set_default_role_handler,
-    show_window, take_open_doc, toggle_fullscreen,
+    OpenDocWake, async_sheet_available, default_handler_bundle_id, hide_window, is_fullscreen,
+    is_window_zoomed, open_urls, own_bundle_id, set_always_on_top, set_default_role_handler,
+    set_open_doc_wake, show_window, take_open_doc, toggle_fullscreen,
 };

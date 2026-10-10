@@ -27,6 +27,12 @@
 - 标题栏：`appears_transparent` + `app_owns_titlebar_drag` + `pl(px(78.))` 让开红绿灯；
   无头测试不能点标题栏按钮（整条挂着 `start_window_move()`，测试平台 `unimplemented!()`）。
 - `toggleFullScreen:` 前要补 `NSWindowCollectionBehaviorFullScreenPrimary`；`fs_settle` 挡 900ms。
+- **系统「打开文件」（访达双击 / 右键打开方式 / 拖 Dock）绝不能自己挂 `NSAppleEventManager`**
+  处理器（AppKit 在 finishLaunching 会覆盖掉）→ 走 `application.on_open_urls(native::open_urls)`
+  （回调给的是百分号编码 file:// 字符串，`isFileURL()` + `to_file_path()` 解路径）。
+  且帧循环闲着时没人看队列 → native 入队后 `smol::channel` 拍一下，常驻任务
+  `App::watch_open_docs` 醒来 `pump_open_docs`（不是轮询）。接线由
+  `system_open_docs_wiring` 扫源码钉住。
 - 字形覆盖不可靠 → 按钮一律中文小字 chip / 内置 SVG。
 - 浮层与舞台在一条冒泡链上（`Window::hit_test` 反向遍历，同点的 hitbox 全收）→ 绝对定位浮层必须
   `.id()` + `cx.listener(|_,_,_,cx| cx.stop_propagation())`。
@@ -54,6 +60,22 @@
   （tiny-skia 给预乘 RGBA，要先除回 alpha）。
 - sidecar 名一律经 `ffmpeg::exe_name()` 拼 `EXE_SUFFIX`（Windows `Path::is_file()` 不补扩展名）。
 - `[profile.release] strip = "debuginfo"`（别写 true）+ `panic = "unwind"`。
+
+## 显存 / 纹理（勿回退）——「播久了自动崩」的根因
+- **GPUI 的精灵图集只增不减**：`AtlasState::tiles_by_key` 对每个没见过的
+  `RenderImage::id` 分配一块 tile（etagere），**只有显式 `Window::drop_image()` 才回收**，
+  没有任何自动 GC。播放器每解一帧就造一个新 `RenderImage`（新 id），所以
+  **每帧都在显存里留一块大纹理** —— 实测 720p 片子 `phys_footprint` **+120MB/s**，
+  播几分钟被系统干掉，**且不留 panic 日志**（不是 panic，是资源限制杀进程，最难查）。
+- 正解：`App.shown_frame: Option<Arc<RenderImage>>` 记「上一帧画到屏幕上的纹理」，
+  `render_stage` 里 `needs_retire(旧 id, 新 id)` 为真就 `let _ = window.drop_image(旧)`。
+  判据只看 `id`（同一帧反复取出来 —— 暂停冻结 / 拖动停住 —— 不能白撤）；
+  画面来源整个消失（切图片 / 音频 / 空舞台）也要撤。`apply_orientation` 换静态图纹理同理。
+  撤掉的 tile 若还被上一帧场景引用，macOS 渲染器会跳过（gpui-pre-apple `metal_atlas.rs` 注释）。
+- 验证：实测 +120MB/s → **3 分钟 135→143MB 水平**；钉子 `frame_retire_tests`
+  （真值表 + 源码扫描 `render_stage`/`apply_orientation` 必须调 `drop_image`），回退确认变红。
+- 排查手法：`footprint -p <pid>`（RSS 看不全，共享模式的 Metal 纹理要 `phys_footprint`）；
+  `.ips` 崩溃报告里 `SIGKILL (Code Signature Invalid)` 是 `cp` 覆盖 app 内二进制导致，与本条无关。
 
 ## UI 规范（用户明确要求）
 - 画面适配一律 `ObjectFit::Contain`（绝不用 Fill）；静态图片按原尺寸、不放大；黑白单色（不用蓝色）；

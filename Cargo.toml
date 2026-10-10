@@ -53,11 +53,9 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSWindow",
 ] }
 # 「用 iPlayer 打开」的文件**不在 argv 里**，是 macOS 的 aevt/odoc Apple Event，
-# 得自己去 AppleEventManager 上挂处理器（见 src/native.rs）。这里只要类型定义；
-# 那几个方法在 objc2-foundation 里被 objc2-core-services 门控着，我们用 msg_send 直接发。
+# 由 gpui 的应用委托口子 `on_open_urls` 送进来（见 src/native.rs）—— 那边给的是
+# 百分号编码的 `file://` 字符串，所以这里需要 NSURL 解回本地路径。
 objc2-foundation = { version = "0.3.2", features = [
-    "NSAppleEventDescriptor",
-    "NSAppleEventManager",
     "NSBundle",
     "NSString",
     "NSURL",

@@ -147,16 +147,25 @@ fn install_panic_logger() {
 }
 
 fn gui(initial: Option<std::path::PathBuf>) {
-    // 访达里双击 / "打开方式 → iPlayer" 时，macOS 发的是一条 Apple Event，
-    // **文件不在 argv 里**，所以必须先把处理器挂上（要在应用跑起来之前）。
-    native::install_open_docs();
+    let application = gpui_kit::application();
 
-    // 事件有时比窗口先到（窗口建得慢），这里先捞一次，剩下的交给每帧的 tick
+    // 访达里双击 / "打开方式 → iPlayer" / 拖到 Dock 图标时，macOS 发的是一条
+    // Apple Event（aevt/odoc），**文件不在 argv 里**。AppKit 在 finishLaunching
+    // 里会给它装自己的处理器，然后把它交给应用委托的 `application:openURLs:` ——
+    // gpui-pre 把这个口子透出来了，接上它就行（自己往 NSAppleEventManager 上挂
+    // 处理器是白搭，见 native.rs 里那段说明）。
+    application.on_open_urls(native::open_urls);
+
+    // 事件到位那一刻没有 GPUI 上下文，只能排进队列 + 拍一下这个通道；
+    // 真正取件的是下面挂给窗口的那条常驻任务（帧循环闲着时也得有人看队列）。
+    let (open_doc_tx, open_doc_rx) = smol::channel::unbounded();
+    native::set_open_doc_wake(open_doc_tx);
+
+    // 事件有时比窗口先到（窗口建得慢），这里先捞一次，剩下的交给 tick / 常驻任务
     let initial = initial.or_else(native::take_open_doc);
 
     // Dock 图标被点（应用没有可见窗口时）：把藏起来的窗口亮回来。
     // 注意 on_reopen 挂在 Application 上（run 之前注册），回调里才拿到 &mut App。
-    let application = gpui_kit::application();
     application.on_reopen(|cx| show_main_window(cx));
     application.run(move |cx| {
         gpui_kit::init(cx);
@@ -179,6 +188,9 @@ fn gui(initial: Option<std::path::PathBuf>) {
                 if let Some(path) = initial {
                     app.update(cx, |app, cx| app.load_initial(path, cx));
                 }
+                // 常驻等"系统让我们打开某个文件"的信号（帧循环闲着的时候，
+                // 没有别的路能发现队列里有东西）。
+                app::watch_open_docs(&app, open_doc_rx, cx);
                 app
             })
             .expect("打开窗口失败");

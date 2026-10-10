@@ -223,6 +223,14 @@ pub struct App {
     /// 正在播/正在看的绝对路径，用来给列表打高亮
     active_path: Option<String>,
     stage: Stage,
+    /// 上一次真正画到屏幕上的那一帧。
+    ///
+    /// **必须在换帧时把旧的交回给 GPUI 撤掉**（`Window::drop_image`）：
+    /// 精灵图集对每个没见过的纹理都留一块 tile，而且**只增不减** ——
+    /// 播放器每解一帧就造一个新 `RenderImage`（新 id），不撤的话图集里
+    /// 每帧都留一块 BGRA 大纹理。实测 1080p 片子 +120MB/s 的 footprint 增长，
+    /// 播几分钟就被系统杀掉（还不留 panic 日志，最难查的那种）。
+    shown_frame: Option<Arc<RenderImage>>,
 
     // — 控制条 —
     /// 0.0 – 1.0 的归一化位置；这样不用因为时长变化去改滑块的 max
@@ -356,6 +364,46 @@ fn kind_cn(kind: &str) -> &'static str {
     }
 }
 
+/// 换帧时要不要把**旧**那一帧的纹理交回给图集（`Window::drop_image`）。
+///
+/// 判据只看 `RenderImage::id`：id 变了（真的换了新的一帧）就撤旧的；
+/// 还是同一个 id 就别动 —— 暂停冻结、拖进度条停在旧画面上时，`frame()`
+/// 每帧都返回同一个 `Arc`，这时候去撤纹理是白干活（下一帧还得再传一遍）。
+/// 新的一帧没有了（切到图片 / 音频 / 空舞台）同样要撤，否则最后一帧会
+/// 被图集一直扣着不放。
+fn needs_retire(old_id: Option<usize>, new_id: Option<usize>) -> bool {
+    match new_id {
+        Some(n) => old_id != Some(n),
+        None => old_id.is_some(),
+    }
+}
+
+/// 常驻的"取系统派发文件"任务。
+///
+/// 为什么不能只靠 `tick` 取：帧循环是**按需**的 —— 没有媒体、没有面板的时候
+/// `tick` 一进来就 `return`，没人再要下一帧（`request_animation_frame` 是唯一
+/// 的帧源）。而系统派发的"打开这个文件"正是**这种情况下**来的：应用已经开着、
+/// 闲着，用户在访达里右键"打开方式 → iPlayer"。文件排进了 native 的队列，
+/// 却没人去看 —— 用户看到的就是"应用是起来了，但不播，左侧列表也是空的"。
+///
+/// 所以挂一条常驻任务在这里：native 收到文件就拍一下通道，它把文件取出来打开。
+/// **不是轮询** —— 平时一觉睡到底，只有真被拍才醒（所以也不烧 CPU）。
+pub fn watch_open_docs(app: &Entity<App>, wake: native::OpenDocWake, cx: &mut gpui_kit::App) {
+    let weak = app.downgrade();
+    cx.spawn(async move |cx| {
+        // 通道没了（native 那边没了）或视图没了就收工
+        while wake.recv().await.is_ok() {
+            if weak
+                .update(cx, |app, cx| app.pump_open_docs(cx))
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
 impl App {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // 红绿灯的"关闭"= **藏起来**，不是销毁：窗口没了 App 状态（播放列表、
@@ -433,6 +481,7 @@ impl App {
             info: None,
             active_path: None,
             stage: Stage::Empty,
+            shown_frame: None,
             seek,
             volume,
             scrubbing: false,
@@ -478,6 +527,25 @@ impl App {
     /// 命令行给了一个媒体文件/文件夹时的入口。
     pub fn load_initial(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.load_path(path, cx);
+    }
+
+    /// 系统派发过来的文件（访达双击 / 右键"打开方式 → iPlayer" / 拖到 Dock 图标）：
+    /// 把队首那个打开，顺手报一下同批多出来的。
+    ///
+    /// 两个调用者：`tick`（每帧）和 [`App::watch_open_docs`] 那条常驻任务
+    ///（帧循环停着的时候只有它在看队列）。
+    fn pump_open_docs(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = native::take_open_doc() else {
+            return;
+        };
+        let extra = std::iter::from_fn(native::take_open_doc).count();
+        self.load_path(path, cx);
+        if extra > 0 {
+            self.toast(
+                format!("已打开选中的第一个文件（同批还有 {extra} 个，都在左侧列表里）"),
+                cx,
+            );
+        }
     }
 
     fn toast(&mut self, msg: impl Into<String>, cx: &mut Context<Self>) {
@@ -889,7 +957,12 @@ impl App {
 
     /// 换一个画面朝向：视频重开一次解码（滤镜链带上新角度），
     /// 静态图片在 CPU 上重算一遍纹理。位置、播放状态都不受影响。
-    fn apply_orientation(&mut self, orient: Orientation, cx: &mut Context<Self>) {
+    fn apply_orientation(
+        &mut self,
+        orient: Orientation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.has_picture() {
             self.toast("先打开一个文件再调画面角度", cx);
             return;
@@ -904,7 +977,16 @@ impl App {
             if let Some(base) = &self.still_base {
                 let base = base.clone();
                 if let Some(img) = crate::player::orient_image(&base, orient) {
+                    // 换了纹理就得把上一张交回图集 —— 同 `render_stage` 里的道理，
+                    // 每次转角度都造一张新图，不退旧的话转几圈就攒下几百 MB。
+                    let old = match &self.stage {
+                        Stage::Image(i) => Some(i.clone()),
+                        _ => None,
+                    };
                     self.stage = Stage::Image(img);
+                    if let Some(old) = old {
+                        let _ = window.drop_image(old);
+                    }
                 }
             }
         }
@@ -1229,16 +1311,8 @@ impl App {
         // 系统让本应用打开的文件（访达双击 / 右键"打开方式" / 拖到 Dock 图标）。
         // 它**不走 argv**，是 native 那边从 Apple Event 里收进队列的，这里每帧捞一次。
         // 放在最前面：不能被后面任何一个提前 return 跳过。
-        if let Some(path) = native::take_open_doc() {
-            let extra = std::iter::from_fn(native::take_open_doc).count();
-            self.load_path(path, cx);
-            if extra > 0 {
-                self.toast(
-                    format!("已打开选中的第一个文件（同批还有 {extra} 个，都在左侧列表里）"),
-                    cx,
-                );
-            }
-        }
+        // （帧循环停着的时候由 `watch_open_docs` 那条常驻任务捞。）
+        self.pump_open_docs(cx);
 
         // 第一帧问一次系统：媒体文件现在归谁打开
         if self.check_default_once {
@@ -2060,6 +2134,21 @@ impl App {
         let fit = ObjectFit::Contain;
         let frame = self.player.as_mut().and_then(|p| p.frame());
 
+        // 换帧就把上一帧的纹理从 GPUI 的精灵图集里撤掉 —— 图集对每个新 id 只增不减，
+        // 不撤的话每帧都在显存里留下一个 1080p 的 BGRA 大块（实测 +120MB/s，
+        // 播几分钟被系统杀掉）。判据用 `id` 而不是 `Arc::ptr_eq`：同一帧被反复
+        // 取出来时（暂停冻结、拖进度条停在旧画面上）id 不变，正好什么都不做。
+        // 画面来源整个消失时（切到图片 / 音频 / 空舞台）也要撤，否则最后那帧
+        // 会一直被图集扣着。撤掉的 tile 若还被上一帧的场景引用，macOS 渲染器
+        // 会跳过它（见 gpui-pre-apple 的 metal_atlas 注释），不会崩。
+        let new_id = frame.as_ref().map(|f| f.id.0);
+        if needs_retire(self.shown_frame.as_ref().map(|f| f.id.0), new_id) {
+            if let Some(old) = self.shown_frame.take() {
+                let _ = window.drop_image(old);
+            }
+            self.shown_frame = frame.clone();
+        }
+
         let body: AnyElement = if let Some(image) = frame {
             img(ImageSource::Render(image))
                 .object_fit(fit)
@@ -2455,7 +2544,7 @@ impl App {
                 .hover(|s| s.bg(pal.hover()))
                 .debug_selector(move || id.to_string())
                 .on_click(
-                    cx.listener(move |this, _, _, cx| this.apply_orientation(next, cx)),
+                    cx.listener(move |this, _, window, cx| this.apply_orientation(next, window, cx)),
                 )
                 .child(SharedString::from(label))
         });
@@ -2482,8 +2571,8 @@ impl App {
                         .text_color(if cur.is_identity() { pal.muted() } else { pal.text() })
                         .hover(|s| s.bg(pal.hover()))
                         .debug_selector(|| "orient-reset".to_string())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.apply_orientation(Orientation::IDENTITY, cx)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.apply_orientation(Orientation::IDENTITY, window, cx)
                         }))
                         .child("恢复原始"),
                 ),
@@ -3138,7 +3227,6 @@ impl Focusable for App {
 #[cfg(test)]
 mod tests {
     use super::{load_logo, round_corners};
-
     /// 「要下一帧」这个动作只许出现在渲染路径里。
     ///
     /// `Window::request_animation_frame()` 内部是
@@ -3200,6 +3288,116 @@ mod tests {
                 "app.rs 第 {line} 行在 tick 之外调了 begin_export —— 它会要下一帧，只能从渲染路径进"
             );
         }
+    }
+
+    /// 「系统派发打开文件」这条链的接线不许断。
+    ///
+    /// 回归症状：访达里右键"打开方式 → iPlayer"，应用起来了却不播、左侧列表
+    /// 也是空的。链路有三段，断哪一段都是这个症状：
+    ///   ① main：gpui 的委托口子 `on_open_urls` 接到 `native::open_urls`，
+    ///      并把唤醒通道交给 native（事件到达时没有 GPUI 上下文，只能排队 + 拍一下）；
+    ///   ② app：`tick` 每帧捞一次队列；窗口构建时挂上常驻任务
+    ///      `watch_open_docs` —— 帧循环闲着时（没媒体、没面板）**只有它**在看队列
+    ///      （临时撤掉它跑过一遍：空闲时"打开方式"确实不再生效，所以它不是摆设）；
+    ///   ③ native：路径进队列 + 拍通道。
+    ///
+    /// 另钉一条**否定**项：不许回到自己往 `NSAppleEventManager` 上挂 aevt/odoc
+    /// 处理器的老路 —— AppKit 在 `-finishLaunching` 里会给同一对 (class, id)
+    /// 装上它自己的处理器，把我们抢先注册的那份覆盖掉，事件根本到不了我们手里
+    /// （这正是当年"双击没反应"的根因，见 native.rs 的说明）。
+    #[test]
+    fn system_open_docs_wiring() {
+        let main = include_str!("main.rs");
+        let native = include_str!("native.rs");
+        let app = include_str!("app.rs");
+
+        // ① main 的两处接线（拼串是为了别扫到这条测试自己）
+        assert!(
+            main.contains(concat!("application.on_open_", "urls(native::open_urls)")),
+            "main.rs 必须把 on_open_urls 接到 native::open_urls —— 没有它，\
+             访达双击 / 右键「打开方式」送来的 Apple Event 一个人都收不到"
+        );
+        assert!(
+            main.contains(concat!("native::set_open_doc_", "wake(open_doc_tx)")),
+            "main.rs 必须把唤醒通道交给 native —— 没有它，事件到了也叫不醒 UI"
+        );
+        assert!(
+            main.contains(concat!("app::watch_open_", "docs(&app, open_doc_rx, cx)")),
+            "main.rs 必须在开窗口时挂上常驻取件任务 —— 帧循环闲着时没人看队列"
+        );
+
+        // ② app 这边：tick 每帧捞 + 常驻任务兜底（两个消费者都走同一个 pump）
+        assert!(
+            app.contains(concat!("fn pump_open_", "docs(")),
+            "app.rs 必须有 pump_open_docs（取件逻辑的唯一入口）"
+        );
+        assert!(
+            app.contains(concat!("self.pump_open_", "docs(cx);")),
+            "tick 必须每帧捞一次系统派发的文件"
+        );
+        assert!(
+            app.contains(concat!("pub fn watch_open_", "docs(")),
+            "app.rs 必须有常驻取件任务 watch_open_docs"
+        );
+
+        // ③ native：路径进队列、拍通道
+        assert!(
+            native.contains(concat!("fn push_", "paths(")),
+            "native 必须有统一的入队口（排路径 + 拍通道）"
+        );
+        assert!(
+            native.contains(concat!("OPEN_DOC_WAKE.", "get()")),
+            "入队之后必须拍一下唤醒通道"
+        );
+
+        // 否定项：老路彻底封死（扫的是注册调用本身；native.rs 的**注释**里
+        // 还留着对这段历史的说明，别去扫注释）。
+        assert!(
+            !native.contains(concat!("setEvent", "Handler")),
+            "别回到自己挂 aevt/odoc 处理器的老路 —— AppKit 会在 finishLaunching 里覆盖掉它"
+        );
+    }
+
+    /// `on_open_urls` 送来的是 `NSURL.absoluteString` —— **百分号编码**过的
+    /// `file://` 字符串（路径里有空格、中文是常态），必须解回本地路径才能
+    /// 去解码；解不出来的（不是本地文件）直接忽略，不许把坏路径塞进列表。
+    /// 顺便验证入队时会拍一下唤醒通道（常驻任务就靠它醒）。
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn open_urls_decode_file_urls_and_ring_the_wake() {
+        let (tx, rx) = smol::channel::unbounded();
+        crate::native::set_open_doc_wake(tx);
+
+        let name = format!("iplayer test-{}.mp4", std::process::id());
+        let mut encoded = String::from("file:///tmp/");
+        for b in name.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' => {
+                    encoded.push(b as char)
+                }
+                _ => encoded.push_str(&format!("%{b:02X}")),
+            }
+        }
+        crate::native::open_urls(vec![encoded.clone(), "not-a-url".into()]);
+
+        // 排进队列的同时拍了一下
+        assert_eq!(
+            rx.try_recv().map(|_| ()).ok(),
+            Some(()),
+            "open_urls 入队后必须拍唤醒通道"
+        );
+
+        // 路径被正确解回（空格还原，没被 percent 编码原样留在路径里）
+        let got = crate::native::take_open_doc().expect("合法 file:// 应进队列");
+        assert_eq!(got.file_name().map(|s| s.to_string_lossy().to_string()),
+                   Some(name),
+                   "百分号编码必须解回本地路径");
+
+        // 非法 URL 被忽略：队列应该已经空了
+        assert!(
+            crate::native::take_open_doc().is_none(),
+            "解不出来的 URL 不该进队列"
+        );
     }
 
     /// 落地页 logo 编译期嵌入，解码必须一直可用；顺便钉住尺寸与 R/B 通路。
@@ -4084,13 +4282,35 @@ mod export_click_tests {
     /// `catch_unwind` 兜底：无论支持不支持，点击的结果只能是"弹面板"或"给提示"。
     ///
     /// 入口是**工具箱面板**里的那一行（控制条上的截图按钮已按用户要求移除）。
+    ///
+    /// 素材现场用 ffmpeg 造（早先写死 `/tmp/selftest-audio.mp4`，那条文件被
+    /// 系统清掉后这条测试就永远红了 —— 测试不许依赖上一次会话的残骸）。
+    /// 机器上没有 ffmpeg 就跳过，不把环境问题算成回归。
     #[gpui::test]
     fn clicking_snapshot_row_never_panics(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join("iplayer-unit");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("snap-src.mp4");
+        if !src.exists() {
+            let Ok(mut cmd) = crate::ffmpeg::base_command() else {
+                return;
+            };
+            let ok = cmd
+                .args(["-v", "error", "-f", "lavfi", "-i"])
+                .arg("testsrc=size=160x120:rate=25:duration=1")
+                .args(["-pix_fmt", "yuv420p", "-an", "-y"])
+                .arg(&src)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok || !src.exists() {
+                return;
+            }
+        }
+
         let (cx, held) = harness(cx);
         let app = held.borrow().as_ref().expect("App 实体").clone();
-        app.update_in(cx, |v, _w, cx| {
-            v.open_file(PathBuf::from("/tmp/selftest-audio.mp4"), cx)
-        });
+        app.update_in(cx, |v, _w, cx| v.open_file(src.clone(), cx));
         redraw(cx);
 
         // 控制条上不该再有截图按钮
@@ -5237,5 +5457,70 @@ mod panel_timeout_tests {
         );
         assert!(cx.update(|_, cx| app.read(cx).sidebar), "侧栏不该被一起切掉");
         assert_eq!(seen_age(cx, &held), None, "Esc 收面板后计时表也该停");
+    }
+}
+
+/// 换帧要把上一帧的纹理交回 GPUI 的精灵图集（`Window::drop_image`）。
+///
+/// 背景：图集（`AtlasState::tiles_by_key` + etagere 分配器）对**每个没见过的
+/// `RenderImage::id`** 都分配一块 tile，而且只有显式 `remove` 才回收。播放器
+/// 每解码一帧就造一个新 `RenderImage`，所以不撤的话每帧都在显存里留下一块
+/// 1080p 的 BGRA 纹理 —— 实测 `phys_footprint` +120MB/s，播几分钟就被系统
+/// 杀掉，而且**不留任何 panic 日志**（不是 panic，是被资源限制干掉的）。
+#[cfg(test)]
+mod frame_retire_tests {
+    use super::*;
+
+    /// 判据真值表：换新帧才撤旧的；同一帧反复取出来（暂停冻结、拖动停住）
+    /// 不许动；新的一帧没了（切图片 / 音频 / 空舞台）也要撤。
+    #[test]
+    fn retire_decision_truth_table() {
+        assert!(!needs_retire(None, None), "本来就没画过，没什么好撤的");
+        assert!(needs_retire(None, Some(7)), "第一帧上屏：没有旧的可撤，但要记账");
+        assert!(!needs_retire(Some(7), Some(7)), "还是同一帧 —— 别白撤（撤了下一帧还得再传）");
+        assert!(needs_retire(Some(7), Some(8)), "换了新的一帧 —— 必须把旧纹理交回去");
+        assert!(needs_retire(Some(7), None), "画面来源没了 —— 最后一帧也不能被图集扣着");
+    }
+
+    /// 源码扫描（这条没法无头真跑：无头平台没有 Metal 图集，`drop_image`
+    /// 走的是 HeadlessAtlas，撤没撤看不出来）：
+    /// 取帧的那段路径里必须真的调 `window.drop_image(...)`，而且必须由
+    /// `needs_retire` 把着门 —— 少了任何一半，图集都会重新只增不减。
+    #[test]
+    fn stage_retires_the_previous_frame_into_the_atlas() {
+        let src = include_str!("app.rs");
+
+        /// 某个方法的函数体范围（下一个同缩进的 `fn` 之前都算它的）。
+        fn fn_range(src: &str, sig: &str) -> (usize, usize) {
+            let start = src.find(sig).unwrap_or_else(|| panic!("找不到 {sig}"));
+            let rest = &src[start + 1..];
+            let end = match rest.find("\n    fn ") {
+                Some(i) => start + 1 + i,
+                None => src.len(),
+            };
+            (start, end)
+        }
+
+        let (a, b) = fn_range(src, "    fn render_stage(");
+        let body = &src[a..b];
+
+        // 拼出来是为了让"要扫的字符串"不出现在这条测试自己的源码里
+        let drop_call = concat!("window.drop_", "image(");
+        assert!(
+            body.contains(drop_call),
+            "render_stage 里必须把上一帧交回图集（{drop_call}…），否则长时间播放会把显存吃干"
+        );
+        assert!(
+            body.contains("needs_retire("),
+            "撤帧必须由 needs_retire 把门（同一帧反复取出来时不能白撤）"
+        );
+
+        // 静态图片换角度也会造新纹理，同样得退旧的那张
+        let (c, d) = fn_range(src, "    fn apply_orientation(");
+        let orient_body = &src[c..d];
+        assert!(
+            orient_body.contains(drop_call),
+            "apply_orientation 换静态图片纹理时也要撤掉上一张"
+        );
     }
 }
