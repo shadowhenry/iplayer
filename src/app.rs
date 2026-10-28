@@ -1298,7 +1298,10 @@ impl App {
         self.is_default_player = false;
         let (Some(own), Some(current)) = (
             native::own_bundle_id(),
-            native::default_handler_bundle_id("public.movie"),
+            // 用具体的 public.mpeg-4 而非抽象父类 public.movie 做判据：
+            // 我们静默写进 plist 的 LSHandlerRoleAll 对具体 UTI 一定能反映出来，
+            // 避免"设了还是被认为不是默认"导致每次启动都重写一遍。
+            native::default_handler_bundle_id("public.mpeg-4"),
         ) else {
             return;
         };

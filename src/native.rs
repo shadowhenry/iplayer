@@ -278,19 +278,105 @@ mod imp {
     const K_LS_ROLES_VIEWER: u32 = 0x0000_0002;
     const K_LS_ROLES_ALL: u32 = 0xFFFF_FFFF;
 
-    /// 把 iPlayer 设为这些内容类型的默认打开方式。
+    /// 把 iPlayer 设成这些内容类型的默认打开方式。
     ///
-    /// 这就是访达"显示简介 → 打开方式 → 全部更改"背后调的东西 —— 系统里
-    /// 唯一能程序化改默认应用的公开 API。
+    /// 实现上**直接改写** `~/Library/Preferences/com.apple.LaunchServices/
+    /// com.apple.launchservices.secure.plist` 的 `LSHandlers`，给每个类型写一条
+    /// `LSHandlerRoleAll = com.iplayer.app`。这样做正好解决之前的两个坑：
     ///
-    /// 返回成功设置的个数。必须以 `.app` 形式运行：它认的是 bundle identifier，
-    /// 直接跑 `target/release/iplayer` 时拿不到有效的 bundle id。
+    /// ① **静默、不弹框** —— 之前用 `LSSetDefaultRoleHandlerForContentType`
+    ///    （见 [`set_defaults_via_lsapi`] 兜底），它在覆盖已有默认
+    ///    （TV / QuickTime / XLPlayer）时会**每个格式弹一次确认框**，几十个类型
+    ///    就是几十次点击；直接写 plist 不触发任何 UI。
+    /// ② **真能覆盖** —— 系统对"冲突"类型（m4v→TV、mkv→XLPlayer…）只认
+    ///    `LSHandlerRoleAll` / `LSHandlerRoleViewer` 这类**具体角色**条目，
+    ///    而 `LSSetDefaultRoleHandlerForContentType` 写的是 `LSHandlerRoleNone`，
+    ///    会被对方的具体角色条目压住，于是双击还是开别的播放器。直接写
+    ///    `LSHandlerRoleAll` 才和 VLC / IINA 一个路数，能真正抢到默认。
+    ///
+    /// 返回成功设置的个数。必须以 `.app` 形式运行（认 bundle identifier）。
     pub fn set_default_role_handler(utis: &[String]) -> Result<usize, String> {
         let bundle = NSBundle::mainBundle();
         let Some(id) = bundle.bundleIdentifier() else {
             return Err("请以 iPlayer.app 的形式运行（直接跑命令行二进制拿不到 bundle id）".into());
         };
+        let id = id.to_string();
+        match set_defaults_via_plist(&id, utis) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                eprintln!("直接写 LaunchServices 配置失败（{e}），退回 LaunchServices API");
+                set_defaults_via_lsapi(&id, utis)
+            }
+        }
+    }
 
+    /// 直接改写 LaunchServices 的 `LSHandlers`，给每个 uti 写一条
+    /// `LSHandlerRoleAll = bundle`。用系统自带的 python3（macOS 必有）做 plist
+    /// 读写，避免引入额外依赖；写完 kill 掉 cfprefsd 让系统重新加载。
+    fn set_defaults_via_plist(bundle: &str, utis: &[String]) -> Result<usize, String> {
+        const SCRIPT: &str = r#"
+import plistlib, os, sys, subprocess
+p = os.path.expanduser("~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist")
+bundle = sys.argv[1]
+utis = sys.argv[2:]
+data = {}
+if os.path.exists(p):
+    try:
+        with open(p, 'rb') as f:
+            data = plistlib.load(f)
+    except Exception:
+        data = {}
+handlers = list(data.get("LSHandlers", []))
+role = "LSHandlerRoleAll"
+target = set(utis)
+out = []
+for h in handlers:
+    if h.get("LSHandlerContentType") in target:
+        continue
+    out.append(h)
+for u in utis:
+    out.append({"LSHandlerContentType": u, role: bundle})
+data["LSHandlers"] = out
+with open(p, 'wb') as f:
+    plistlib.dump(data, f)
+user = os.environ.get("USER", "")
+# 写完后必须让 LaunchServices 守护进程（lsd）重新加载配置，否则它缓存的
+# 数据库不会立刻生效 —— 之前 9 种「锁死」格式（m4v/mkv/avi…）一直开别的
+# 播放器，根因就是只重启了 cfprefsd、没重启 lsd。杀掉 lsd 它会自动重生并
+# 读回我们刚写的 plist。
+for daemon in ("cfprefsd", "lsd"):
+    try:
+        subprocess.run(["killall", "-u", user, daemon], check=False)
+    except Exception:
+        pass
+print(len(utis))
+"#;
+        let python = if std::path::Path::new("/usr/bin/python3").exists() {
+            "/usr/bin/python3"
+        } else {
+            "python3"
+        };
+        let mut cmd = std::process::Command::new(python);
+        cmd.arg("-c").arg(SCRIPT).arg(bundle);
+        for u in utis {
+            cmd.arg(u);
+        }
+        let out = cmd
+            .output()
+            .map_err(|e| format!("无法调用 python3 写 LaunchServices 配置: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "写默认应用配置失败: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(utis.len())
+    }
+
+    /// 兜底：用 LaunchServices 公开 API 设默认（可能弹确认框、且覆盖不了已有默认
+    /// 的类型）。仅当上面的 plist 直写不可用（极端情况没有 python3）时走。
+    fn set_defaults_via_lsapi(bundle: &str, utis: &[String]) -> Result<usize, String> {
+        let id = objc2_foundation::NSString::from_str(bundle);
         let mut ok = 0usize;
         let mut first_err = None;
         for uti in utis {
@@ -316,11 +402,10 @@ mod imp {
             };
             if pstatus == 0 || astatus == 0 {
                 ok += 1;
-            } else {
-                eprintln!("  !! 设默认失败: {uti}  Viewer={pstatus}  All={astatus}");
-                if first_err.is_none() {
-                    first_err = Some(format!("{uti}: Viewer OSStatus {pstatus}, All OSStatus {astatus}"));
-                }
+            } else if first_err.is_none() {
+                first_err = Some(format!(
+                    "{uti}: Viewer OSStatus {pstatus}, All OSStatus {astatus}"
+                ));
             }
         }
 

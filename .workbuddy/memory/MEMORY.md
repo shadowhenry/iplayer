@@ -114,16 +114,38 @@
 - 字幕浮层：底部居中（下边距 6%），多行逐行渲染，深色半透明底 + 白字（任何画面上都可读）；
   打开文件时自动找同名 sidecar（`.srt`/`.ass`/`.vtt`）。
 
-## 文件关联 / 默认播放器（2026-10-28 新增）
+## 文件关联 / 默认播放器（2026-10-28 新增，当日修过两版）
 - 之前"双击音视频没用 iPlayer 开"的根因：冷门格式（mkv/avi/flv/rmvb/wma/ape…）macOS **没有系统 UTI**，
   只声明 `public.movie`/`public.audio` 永远关联不上它们。
 - 正解（`media.rs`）：每个扩展名申自定义 UTI `com.iplayer.<ext>` 并 `UTTypeConformsTo` 父类，
   写进 `Info.plist` 的 `UTImportedTypeDeclarations`（见 `doc_types_plist`）；`CFBundleDocumentTypes`
-  里**音视频 `LSHandlerRank=Default`、图片 `Alternate`**（不抢 Preview）。
-- `all_utis()` 只收音视频（含具体子类 UTI：public.mp3 / public.mpeg-4 / com.apple.m4a-audio …），
-  供 `set_default_role_handler`（⌘D 与 `--set-default`）逐个设默认；图片排除。
-- `check_default_player()` 启动首次 tick 检测到不是默认就**自动设一次**（幂等），装好即默认播放器，
-  不用手动 ⌘D。改这条接线先临时回退确认变红。
+  里**音视频 `LSHandlerRank=Default`、图片 `Alternate`**（不抢 Preview）。`std_uti(ext)` 把每个扩展名
+  映射到系统**实际的** UTI（见下），`all_utis()` 只收音视频（大类+`std_uti`+自定义 UTI），图片排除。
+- `std_uti()` 映射**必须和 `UTTypeCreatePreferredIdentifierForTag("public.filename-extension", ext)` 查到的
+  实际 UTI 一致**，否则 `LSSetDefaultRoleHandlerForContentType` 吃 `paramErr(-50)` 直接跳过、那个格式
+  永远争不到默认。易错映射（已钉进 `std_uti_matches_system_utis` 测试）：mp4→`public.mpeg-4`（不是
+  quicktime-movie）、mov→`com.apple.quicktime-movie`、m4v→`com.apple.m4v-video`、mkv→
+  `com.blurayplayersoftware.matroska`（不是 `org.matroska.mkv`）、wma→`com.microsoft.windows-media-wma`
+  （不是 `com.microsoft.wma`）、opus→`org.xiph.ogg-audio`（opus 没独立 UTI）、avi→`public.avi`、
+  flv/f4v→`com.adobe.flash.video`、wmv→`com.microsoft.windows-media-wmv`、ts→
+  `public.mpeg-2-transport-stream`、m2ts/mts→`public.avchd-mpeg-2-transport-stream`、rmvb→
+  `com.real.realmedia-vbr`。`set_utis` 里另放 `org.matroska.mkv`/`com.microsoft.wma` 作跨机别名兜底。
+- **默认播放器设法的坑（务必记牢）**：`LSSetDefaultRoleHandlerForContentType`（LaunchServices 公开 API）
+  在**覆盖已有默认**（TV / QuickTime / XLPlayer）时会**每个格式弹一次确认框**
+  （"要通过 iPlayer 打开所有 .m4v 的文稿，还是继续使用 TV？"）。在 `check_default_player` 里
+  **自动调用**它 = 几十个格式 = 几十次点击，用户炸毛。**正解**：`set_default_role_handler` 改成
+  **直接改写** `~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist`
+  的 `LSHandlers`，给每个 uti 写一条 `LSHandlerRoleAll = com.iplayer.app`（python3 做 plist 读写，写完
+  `killall -u $USER cfprefsd` **和 `lsd`** 重新加载），**静默、不弹框**，且能真覆盖所有声明过的格式
+  （和 VLC/IINA 一个路数）。C-API 路径留作 python 缺失时的兜底（`set_defaults_via_lsapi`）。
+- **关键坑（2026-10-29 修正旧结论）**：只 `killall cfprefsd` **不够** —— LaunchServices 守护进程 `lsd`
+  缓存着默认应用数据库，不重启它，`LSCopyDefaultRoleHandlerForContentType` / 访达双击**读不到**我们刚写的
+  plist，于是 m4v/mkv/avi/flv/wmv/wma/ts/m2ts/rmvb 这 9 种继续开 TV/XLPlayer。曾经误判成"macOS 锁定、
+  第三方静默抢不了"——**错**。真相是 lsd 没重载。脚本里**多 kill 一个 `lsd`** 后，27 种格式全部静默默认
+  iPlayer（含那 9 种），`NSWorkspace URLForApplicationToOpenURL:` 探针全绿。改这条务必保留双 kill。
+- `check_default_player()` 启动首 tick 检测到非默认就**自动设一次**（幂等、静默），判据用具体 UTI
+  `public.mpeg-4`（非抽象父类 `public.movie`，否则"设了还被认为不是默认"每启重写）；`is_default_player`
+  置位后不再触发。改这条接线先临时回退确认变红。
 
 ## 最小化暂停（2026-10-28 新增）
 - 用户要求：窗口最小化就停播。`tick` 每帧轮询 `native::is_minimized`（macOS 走 NSWindow
