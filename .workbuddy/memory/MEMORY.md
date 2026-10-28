@@ -114,6 +114,23 @@
 - 字幕浮层：底部居中（下边距 6%），多行逐行渲染，深色半透明底 + 白字（任何画面上都可读）；
   打开文件时自动找同名 sidecar（`.srt`/`.ass`/`.vtt`）。
 
+## 文件关联 / 默认播放器（2026-10-28 新增）
+- 之前"双击音视频没用 iPlayer 开"的根因：冷门格式（mkv/avi/flv/rmvb/wma/ape…）macOS **没有系统 UTI**，
+  只声明 `public.movie`/`public.audio` 永远关联不上它们。
+- 正解（`media.rs`）：每个扩展名申自定义 UTI `com.iplayer.<ext>` 并 `UTTypeConformsTo` 父类，
+  写进 `Info.plist` 的 `UTImportedTypeDeclarations`（见 `doc_types_plist`）；`CFBundleDocumentTypes`
+  里**音视频 `LSHandlerRank=Default`、图片 `Alternate`**（不抢 Preview）。
+- `all_utis()` 只收音视频（含具体子类 UTI：public.mp3 / public.mpeg-4 / com.apple.m4a-audio …），
+  供 `set_default_role_handler`（⌘D 与 `--set-default`）逐个设默认；图片排除。
+- `check_default_player()` 启动首次 tick 检测到不是默认就**自动设一次**（幂等），装好即默认播放器，
+  不用手动 ⌘D。改这条接线先临时回退确认变红。
+
+## 最小化暂停（2026-10-28 新增）
+- 用户要求：窗口最小化就停播。`tick` 每帧轮询 `native::is_minimized`（macOS 走 NSWindow
+  `isMiniaturized`，非 macOS 返回 false）；最小化且正在播 → `player.pause()` 并置
+  `resume_on_restore`，还原后 `player.play()` 续播；纯手动暂停不被还原误续。`busy` 计入 `|| min`
+  保证最小化期间帧循环不停、还原能被捕获。`stop()` 清 `resume_on_restore`。
+
 ## 打包 / 验证
 - `scripts/bundle-macos.sh`（`--dmg` / `--zip` / `--run` / `--install`）；`bundle-windows.ps1`（未实跑）/
   `bundle-linux.sh`（`bash -n` 过）。**`cp` 覆盖 .app 内二进制会破坏签名 → macOS 静默 SIGKILL**，

@@ -231,6 +231,10 @@ pub struct App {
     /// 每帧都留一块 BGRA 大纹理。实测 1080p 片子 +120MB/s 的 footprint 增长，
     /// 播几分钟就被系统杀掉（还不留 panic 日志，最难查的那种）。
     shown_frame: Option<Arc<RenderImage>>,
+    /// 因窗口被最小化而暂停时置位：还原窗口后自动续播。
+    /// 只在"最小化时正在播放"才置位，这样纯暂停（用户手动空格暂停）不会被
+    /// 还原窗口误触发续播；打开新文件 / 停止时清掉。
+    resume_on_restore: bool,
 
     // — 控制条 —
     /// 0.0 – 1.0 的归一化位置；这样不用因为时长变化去改滑块的 max
@@ -478,6 +482,7 @@ impl App {
             _subs: vec![sub_search, sub_seek, sub_vol],
             current: None,
             player: None,
+            resume_on_restore: false,
             info: None,
             active_path: None,
             stage: Stage::Empty,
@@ -747,6 +752,7 @@ impl App {
         self.active_path = None;
         self.current = None;
         self.looping_gif = false;
+        self.resume_on_restore = false;
         self.set_seek_ratio(0.0, window, cx);
         cx.notify();
     }
@@ -1285,8 +1291,9 @@ impl App {
         }
     }
 
-    /// 启动时查一次"系统里媒体文件归谁打开"：不是我们就顺手提示怎么改。
-    /// 已经是默认、或根本没在 .app 里跑（拿不到 bundle id）就什么都不做。
+    /// 启动时查一次"系统里媒体文件归谁打开"：不是默认就**主动设一次**
+    ///（幂等，只动声明过的音视频类型），这样装好打开就是默认播放器，
+    /// 不用手动按 ⌘D。已经是默认、或根本没在 .app 里跑（拿不到 bundle id）就不动。
     fn check_default_player(&mut self, cx: &mut Context<Self>) {
         self.is_default_player = false;
         let (Some(own), Some(current)) = (
@@ -1297,7 +1304,12 @@ impl App {
         };
         self.is_default_player = current == own;
         if !self.is_default_player {
-            self.toast("按 ⌘D 可以把 iPlayer 设为默认播放器", cx);
+            // 用户还没把 iPlayer 设成默认 → 直接设（仅声明过的音视频类型）。
+            // 这样双击音视频就默认用 iPlayer 开，满足"默认都用这个软件播放"。
+            match native::set_default_role_handler(&media::all_utis()) {
+                Ok(_) => self.is_default_player = true,
+                Err(_) => self.toast("按 ⌘D 可以把 iPlayer 设为默认播放器", cx),
+            }
         }
     }
 
@@ -1313,6 +1325,29 @@ impl App {
         // 放在最前面：不能被后面任何一个提前 return 跳过。
         // （帧循环停着的时候由 `watch_open_docs` 那条常驻任务捞。）
         self.pump_open_docs(cx);
+
+        // 窗口被收进 Dock（黄灯最小化）就暂停，还原再续上 —— 用户要求。
+        // 轮询 is_minimized：点最小化那一刻帧循环还在跑（正在播），下一帧就能
+        // 抓到并暂停；还原窗口会让帧循环重新转起来，于是也能立刻续播。
+        // 只在"正在播放"时记 resume_on_restore，纯手动暂停不会被还原误续。
+        let min = native::is_minimized(window);
+        if min {
+            if !self.resume_on_restore
+                && self.player.as_ref().is_some_and(|p| p.is_playing())
+            {
+                if let Some(p) = &mut self.player {
+                    p.pause();
+                }
+                self.resume_on_restore = true;
+                cx.notify();
+            }
+        } else if self.resume_on_restore {
+            self.resume_on_restore = false;
+            if let Some(p) = &mut self.player {
+                p.play();
+            }
+            cx.notify();
+        }
 
         // 第一帧问一次系统：媒体文件现在归谁打开
         if self.check_default_once {
@@ -1475,10 +1510,12 @@ impl App {
         // 注意：`cx.notify()` 唤不醒平台帧源，视频必须显式 request。
         // 「等第一帧」也要算进来：拖进度条时多半是暂停状态，seek 完新画面到了却没人画，
         // 就会一直停在旧画面上。
+        // `min`：最小化期间帧循环不能停，否则还原时没人来抓"已还原"去续播。
         let busy = self
             .player
             .as_ref()
-            .is_some_and(|p| p.is_playing() || p.awaiting());
+            .is_some_and(|p| p.is_playing() || p.awaiting())
+            || min;
 
         // 音频舞台：推进“均衡器”可视化（真实频谱走 Tap，静默退合成）。
         // 舞台尺寸拿不到精确值就按视口扣掉侧栏/标题栏/控制条估一个 ——
@@ -3355,6 +3392,39 @@ mod tests {
         assert!(
             !native.contains(concat!("setEvent", "Handler")),
             "别回到自己挂 aevt/odoc 处理器的老路 —— AppKit 会在 finishLaunching 里覆盖掉它"
+        );
+    }
+
+    /// 「窗口最小化就暂停、还原再续播」这条行为不许断。
+    ///
+    /// 回归症状：点黄灯最小化，视频还在后台播（白烧 CPU / 解码），用户以为停了。
+    /// 接线：tick 每帧轮询 `native::is_minimized`；最小化且正在播就 `pause()`
+    /// 并置 `resume_on_restore`，还原后再 `play()`（纯手动暂停不会被还原误续）。
+    #[test]
+    fn minimize_pauses_playback() {
+        let app = include_str!("app.rs");
+        let native = include_str!("native.rs");
+
+        // native 必须暴露"窗口是否被收进 Dock"的只读查询
+        assert!(
+            native.contains(concat!("pub fn is_minim", "ized(")),
+            "native.rs 必须提供 is_minimized —— tick 靠它判断窗口是否被最小化"
+        );
+
+        // tick 必须轮询它
+        assert!(
+            app.contains(concat!("native::is_minim", "ized(window)")),
+            "tick 必须每帧查 native::is_minimized —— 否则最小化时抓不到暂停时机"
+        );
+
+        // 必须有"这次暂停是最小化导致的"标记，且暂停/续播都挂在它上面
+        assert!(
+            app.contains("resume_on_restore"),
+            "app.rs 必须有 resume_on_restore —— 标记「这次暂停是因为最小化」"
+        );
+        assert!(
+            app.contains("p.pause();") && app.contains("p.play();"),
+            "最小化分支要 p.pause()、还原分支要 p.play()"
         );
     }
 

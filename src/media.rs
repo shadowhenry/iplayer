@@ -30,12 +30,23 @@ pub const IMAGE_EXTS: &[&str] = &[
 ///
 /// 为什么非要扩展名而不仅是 UTI：`rmvb`、`ape`、`ts`、`flv` 这类在 macOS 上
 /// **根本没有对应的 UTI**，只声明 `public.movie` / `public.audio` 的话，
-/// 它们在访达的"打开方式"里永远看不到 iPlayer。
+/// 它们在访达的"打开方式"里永远看不到 iPlayer。所以每个扩展名都单独申一个
+/// `com.iplayer.<ext>`（见 [`doc_types_plist`] 的 `UTImportedTypeDeclarations`），
+/// 并声明它 conform 到 `public.movie` / `public.audio`，LaunchServices 这才会把
+/// ".mkv 归 iPlayer 管"记进数据库 —— 否则双击还是用别的播放器开。
 pub struct DocType {
     /// 给系统看的中文名，会出现在"打开方式"列表的说明里
     pub name: &'static str,
-    /// 内容类型（UTI）。设默认打开方式时也是按这几个去设。
+    /// 大类内容类型（UTI）。`CFBundleDocumentTypes` 会引用它们，
+    /// 设默认打开方式时也是基础。
     pub utis: &'static [&'static str],
+    /// 具体子类 UTI：这些格式在 macOS 上有独立 UTI，单独设默认比只设大类更稳
+    ///（系统按具体 UTI 查默认时不会回退到父类）。设默认失败（系统不认这个 UTI）
+    /// 会被 [`native::set_default_role_handler`] 静默跳过，所以可以放心列全。
+    pub set_utis: &'static [&'static str],
+    /// 是否声明为默认（`LSHandlerRank=Default`）。音视频为 true —— 这就是
+    /// "默认用 iPlayer 打开"的关键；图片为 false，只进"打开方式"、不抢 Preview。
+    pub rank_default: bool,
     pub exts: &'static [&'static str],
 }
 
@@ -43,16 +54,44 @@ pub const DOC_TYPES: &[DocType] = &[
     DocType {
         name: "视频",
         utis: &["public.movie", "public.video"],
+        set_utis: &[
+            "public.mpeg",
+            "public.mpeg-4",
+            "com.apple.quicktime-movie",
+            // 别名 / 备用的 matroska、wma UTI：不同机器上这两个格式的权威 UTI
+            // 可能不同（本机 mkv 是 com.blurayplayersoftware.matroska、wma 是
+            // com.microsoft.windows-media-wma），多设几个候选，哪个存在就争哪个；
+            // 不存在的会被 LSSetDefaultRoleHandler 静默跳过，无害。
+            "org.matroska.mkv",
+            "com.microsoft.wma",
+        ],
+        rank_default: true,
         exts: VIDEO_EXTS,
     },
     DocType {
         name: "音频",
         utis: &["public.audio"],
+        set_utis: &[
+            "public.mp3",
+            "public.mpeg-4-audio",
+            "com.apple.m4a-audio",
+            "public.aiff-audio",
+            "com.microsoft.waveform-audio",
+            "org.xiph.ogg-audio",
+            "org.xiph.flac",
+            "public.aac-audio",
+            "public.ac3-audio",
+            // wma 的备用 UTI（本机是 com.microsoft.windows-media-wma，见 std_uti）
+            "com.microsoft.wma",
+        ],
+        rank_default: true,
         exts: AUDIO_EXTS,
     },
     DocType {
         name: "图片",
         utis: &["public.image", "public.svg-image"],
+        set_utis: &[],
+        rank_default: false,
         exts: IMAGE_EXTS,
     },
 ];
@@ -65,48 +104,163 @@ pub fn all_exts() -> Vec<&'static str> {
         .collect()
 }
 
-/// 所有声明过的内容类型，去重（"设为默认播放器"逐个去设）。
-pub fn all_utis() -> Vec<&'static str> {
-    let mut out: Vec<&'static str> = Vec::new();
+/// 所有要设成默认的 UTI（`--set-default` / 界面里那颗链条图标逐个去设）。
+///
+/// 只收 `rank_default` 的音视频组：大类 + 具体子类 + 每个扩展名的自定义 UTI。
+/// 图片不在内，避免抢 Preview 的默认。返回 `String` 是因为自定义的
+/// `com.iplayer.<ext>` 是运行时拼出来的。
+pub fn all_utis() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |u: String| {
+        if !out.iter().any(|x| *x == u) {
+            out.push(u);
+        }
+    };
     for d in DOC_TYPES {
+        if !d.rank_default {
+            continue;
+        }
         for u in d.utis {
-            if !out.contains(u) {
-                out.push(u);
+            push(u.to_string());
+        }
+        for u in d.set_utis {
+            push(u.to_string());
+        }
+        for e in d.exts {
+            push(format!("com.iplayer.{e}"));
+            // 也设标准 UTI（mp4→com.apple.quicktime-movie、mkv→org.matroska.mkv、
+            // wma→com.microsoft.wma…）：文件双击时系统解析到的是它而不是我们的自定义
+            // UTI，不设默认的话 QuickTime / VLC / XLPlayer 这种「认领了标准 UTI」的
+            // 应用就会继续当默认。set_utis 只覆盖一部分，这里用 std_uti 把其余冷门
+            // 标准 UTI 也一起设上。
+            if let Some(s) = std_uti(e) {
+                push(s.to_string());
             }
         }
     }
     out
 }
 
-/// `Info.plist` 里 `CFBundleDocumentTypes` 那一整段 XML。
+/// 某些扩展名在 macOS 上有**标准的** UTI，文件双击时系统解析到的就是它
+///（而不是我们自申的 `com.iplayer.<ext>`）。要想让 iPlayer 当这些文件的默认，
+/// 必须也「认领」标准 UTI —— 在 `CFBundleDocumentTypes` 里引用它、并把它
+/// 加进 [`all_utis`] 让 `LSSetDefaultRoleHandler` 去设默认。返回 `None` 表示
+/// 这个扩展名没有公认标准 UTI（系统里压根不存在，只能用我们自申的
+/// `com.iplayer.<ext>`，靠它去争默认）。
 ///
-/// 打包脚本直接把 `iplayer --doc-types` 的输出嵌进 plist —— 与其在 shell 里
-/// 再抄一遍几十个扩展名（抄漏一个那个格式就永远关联不上），不如让代码当唯一来源。
+/// ⚠️ 这里的映射必须和**系统实际的** UTI 对齐，否则 `LSSetDefaultRoleHandler`
+/// 会吃 `paramErr(-50)` 直接跳过，那个格式就永远争不到默认。映射不是拍脑袋
+/// 想的 —— 用 `UTTypeCreatePreferredIdentifierForTag("public.filename-extension", …)`
+/// 在目标机器上查过（`src/native.rs` 的改文件关联流程里也依赖它）。例如：
+/// `.mp4` → `public.mpeg-4`（不是 quicktime-movie）、`.mkv` →
+/// `com.blurayplayersoftware.matroska`（不是 `org.matroska.mkv`，那个在本机
+/// 根本没注册）、`.wma` → `com.microsoft.windows-media-wma`、`.opus` →
+/// `org.xiph.ogg-audio`（opus 在系统里没有独立 UTI，和 ogg 共用）。
+fn std_uti(ext: &str) -> Option<&'static str> {
+    Some(match ext {
+        "mp4" => "public.mpeg-4",
+        "mov" => "com.apple.quicktime-movie",
+        "m4v" => "com.apple.m4v-video",
+        "mkv" => "com.blurayplayersoftware.matroska",
+        "webm" => "org.webmproject.webm",
+        "mpg" | "mpeg" => "public.mpeg",
+        "m2v" => "public.mpeg-2-video",
+        "m2ts" | "mts" => "public.avchd-mpeg-2-transport-stream",
+        "ts" => "public.mpeg-2-transport-stream",
+        "mp3" => "public.mp3",
+        "m4a" => "com.apple.m4a-audio",
+        "aac" => "public.aac-audio",
+        "flac" => "org.xiph.flac",
+        "wav" | "wave" => "com.microsoft.waveform-audio",
+        "ogg" | "oga" | "opus" => "org.xiph.ogg-audio",
+        "wma" => "com.microsoft.windows-media-wma",
+        "wmv" => "com.microsoft.windows-media-wmv",
+        "avi" => "public.avi",
+        "flv" | "f4v" => "com.adobe.flash.video",
+        "rmvb" | "rm" => "com.real.realmedia-vbr",
+        "aif" | "aiff" => "public.aiff-audio",
+        "ac3" => "public.ac3-audio",
+        _ => return None,
+    })
+}
+
+/// `iplayer --doc-types` 吐给打包脚本的 XML 片段（嵌进 `Info.plist`）。
+///
+/// 两段：
+/// ① `UTImportedTypeDeclarations` —— 给没有系统 UTI 的格式（mkv/avi/flv/rmvb/wma…）
+///    各自申一个 `com.iplayer.<ext>`，声明它 conform 到 `public.movie` / `public.audio`
+///    / `public.image`。没有这段，这些扩展名在系统里就没有"主人"，永远关联不上本应用。
+/// ② `CFBundleDocumentTypes` —— 声明本应用能打开这些类型。`rank_default` 的音视频
+///    用 `LSHandlerRank=Default`（这就是"默认用 iPlayer 打开"的关键）；图片用
+///    `Alternate`，只进"打开方式"、不抢 Preview。
+///
+/// 与其在 shell 里再抄一遍几十个扩展名（抄漏一个那个格式就永远关联不上），
+/// 不如让这里当唯一来源。
 pub fn doc_types_plist() -> String {
-    let mut out = String::from("<key>CFBundleDocumentTypes</key>\n    <array>\n");
+    // ① UTImportedTypeDeclarations
+    let mut imported = String::from("<key>UTImportedTypeDeclarations</key>\n    <array>\n");
     for d in DOC_TYPES {
-        out.push_str("        <dict>\n");
-        out.push_str(&format!(
+        let parent = d.utis[0]; // public.movie / public.audio / public.image
+        for e in d.exts {
+            let u = format!("com.iplayer.{e}");
+            imported.push_str("        <dict>\n");
+            imported.push_str(&format!(
+                "            <key>UTTypeIdentifier</key><string>{u}</string>\n"
+            ));
+            imported.push_str(
+                "            <key>UTTypeTagSpecification</key>\n            <dict>\n",
+            );
+            imported.push_str(&format!(
+                "                <key>public.filename-extension</key>\n                <array><string>{e}</string></array>\n"
+            ));
+            imported.push_str("            </dict>\n");
+            imported.push_str("            <key>UTTypeConformsTo</key>\n            <array>\n");
+            imported.push_str(&format!("                <string>{parent}</string>\n"));
+            imported.push_str("            </array>\n");
+            imported.push_str(&format!(
+                "            <key>UTTypeDescription</key><string>iPlayer {e} 文件</string>\n"
+            ));
+            imported.push_str("        </dict>\n");
+        }
+    }
+    imported.push_str("    </array>\n");
+
+    // ② CFBundleDocumentTypes
+    let mut types = String::from("<key>CFBundleDocumentTypes</key>\n    <array>\n");
+    for d in DOC_TYPES {
+        types.push_str("        <dict>\n");
+        types.push_str(&format!(
             "            <key>CFBundleTypeName</key><string>{}</string>\n",
             d.name
         ));
-        // Viewer：只读打开。LSHandlerRank=Alternate：能被选中、但不抢系统的默认值
-        // （用户想设默认就用应用里的「设为默认播放器」，或访达里"全部更改"）。
-        out.push_str("            <key>CFBundleTypeRole</key><string>Viewer</string>\n");
-        out.push_str("            <key>LSHandlerRank</key><string>Alternate</string>\n");
-        out.push_str("            <key>LSItemContentTypes</key>\n            <array>\n");
+        // Viewer：只读打开。
+        types.push_str("            <key>CFBundleTypeRole</key><string>Viewer</string>\n");
+        let rank = if d.rank_default { "Default" } else { "Alternate" };
+        types.push_str(&format!(
+            "            <key>LSHandlerRank</key><string>{rank}</string>\n"
+        ));
+        types.push_str("            <key>LSItemContentTypes</key>\n            <array>\n");
         for u in d.utis {
-            out.push_str(&format!("                <string>{u}</string>\n"));
+            types.push_str(&format!("                <string>{u}</string>\n"));
         }
-        out.push_str("            </array>\n");
-        out.push_str("            <key>CFBundleTypeExtensions</key>\n            <array>\n");
         for e in d.exts {
-            out.push_str(&format!("                <string>{e}</string>\n"));
+            types.push_str(&format!("                <string>com.iplayer.{e}</string>\n"));
+            // 也认领标准 UTI（mp4→com.apple.quicktime-movie、mkv→org.matroska.mkv…）：
+            // 文件双击时系统解析到的是它，不认领就争不到默认。
+            if let Some(s) = std_uti(e) {
+                types.push_str(&format!("                <string>{s}</string>\n"));
+            }
         }
-        out.push_str("            </array>\n        </dict>\n");
+        types.push_str("            </array>\n");
+        types.push_str("            <key>CFBundleTypeExtensions</key>\n            <array>\n");
+        for e in d.exts {
+            types.push_str(&format!("                <string>{e}</string>\n"));
+        }
+        types.push_str("            </array>\n        </dict>\n");
     }
-    out.push_str("    </array>");
-    out
+    types.push_str("    </array>");
+
+    format!("{imported}{types}")
 }
 
 #[derive(Serialize, Clone)]
@@ -690,5 +844,104 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(&still_path).ok();
+    }
+
+    /// 打进 Info.plist 的文档类型片段必须正确：
+    /// ① 给没有系统 UTI 的冷门格式申了 `com.iplayer.<ext>` 并 conform 到父类；
+    /// ② 音视频 LSHandlerRank=Default（默认用 iPlayer 打开），图片 Alternate（不抢 Preview）。
+    #[test]
+    fn doc_types_plist_declares_custom_utis_and_default_rank() {
+        let plist = doc_types_plist();
+
+        // 自定义 UTI 与 conform 关系
+        assert!(plist.contains("UTImportedTypeDeclarations"), "缺少 UTImportedTypeDeclarations");
+        assert!(plist.contains("com.iplayer.mkv"), "mkv 这种无 UTI 格式必须申自定义 UTI");
+        assert!(plist.contains("com.iplayer.wma"), "wma 也必须申自定义 UTI");
+        assert!(plist.contains("public.filename-extension"), "必须声明扩展名标签");
+        assert!(plist.contains("UTTypeConformsTo"), "必须声明 conform 关系");
+
+        // 音视频默认、图片不默认
+        assert!(
+            plist.contains("LSHandlerRank</key><string>Default</string>"),
+            "音视频必须 LSHandlerRank=Default 才能成为默认播放器"
+        );
+        assert!(
+            plist.contains("LSHandlerRank</key><string>Alternate</string>"),
+            "图片必须 LSHandlerRank=Alternate，不抢 Preview"
+        );
+
+        // 整体得是合法 plist 片段
+        assert!(plist.contains("CFBundleDocumentTypes"), "缺少 CFBundleDocumentTypes");
+        // Default 应该恰好出现 2 次（视频 + 音频），图片是 Alternate ——
+        // 数量兜底：一旦有人把图片也设成 Default，这里立刻红。
+        assert_eq!(
+            plist.matches("LSHandlerRank</key><string>Default</string>").count(),
+            2,
+            "Default 应该恰好出现 2 次（视频 + 音频），图片不应是 Default"
+        );
+    }
+
+    /// `all_utis` 只收音视频（用于「设为默认」），不含图片，且覆盖具体子类 UTI。
+    #[test]
+    fn all_utis_covers_audio_video_not_images() {
+        let utis = all_utis();
+        assert!(utis.iter().any(|u| u == "public.movie"), "应含视频大类");
+        assert!(utis.iter().any(|u| u == "public.audio"), "应含音频大类");
+        assert!(
+            utis.iter().any(|u| u == "com.iplayer.mkv"),
+            "应含冷门格式的自定义 UTI"
+        );
+        assert!(
+            utis.iter().any(|u| u == "public.mp3"),
+            "应含具体子类 UTI（mp3）"
+        );
+        // 标准 UTI 也要进「设为默认」列表（修文件关联的关键）
+        assert!(
+            utis.iter().any(|u| u == "public.mpeg-4"),
+            "mp4 的标准 UTI 应进列表"
+        );
+        assert!(
+            utis.iter().any(|u| u == "com.blurayplayersoftware.matroska"),
+            "mkv 的实际标准 UTI 应进列表"
+        );
+        assert!(
+            utis.iter().any(|u| u == "com.microsoft.windows-media-wma"),
+            "wma 的实际标准 UTI 应进列表"
+        );
+        assert!(
+            !utis.iter().any(|u| u == "public.image"),
+            "图片不该进「设为默认」列表，否则抢 Preview"
+        );
+        assert!(
+            !utis.iter().any(|u| u.contains("iplayer.jpg")),
+            "图片扩展名不该进默认列表"
+        );
+    }
+
+    /// `std_uti` 的映射必须和**系统实际的** UTI 对齐，否则 `LSSetDefaultRoleHandler`
+    /// 会吃 paramErr 跳过、那个格式永远争不到默认。这里钉住几个曾经错过的：
+    /// mp4 不是 quicktime-movie、mkv 不是 org.matroska.mkv（本机没注册）、
+    /// wma 不是 com.microsoft.wma、opus 和 ogg 共用 org.xiph.ogg-audio。
+    #[test]
+    fn std_uti_matches_system_utis() {
+        assert_eq!(std_uti("mp4"), Some("public.mpeg-4"));
+        assert_eq!(std_uti("mov"), Some("com.apple.quicktime-movie"));
+        assert_eq!(std_uti("m4v"), Some("com.apple.m4v-video"));
+        assert_eq!(std_uti("mkv"), Some("com.blurayplayersoftware.matroska"));
+        assert_eq!(std_uti("wma"), Some("com.microsoft.windows-media-wma"));
+        assert_eq!(std_uti("wmv"), Some("com.microsoft.windows-media-wmv"));
+        assert_eq!(std_uti("avi"), Some("public.avi"));
+        assert_eq!(std_uti("flv"), Some("com.adobe.flash.video"));
+        assert_eq!(std_uti("ts"), Some("public.mpeg-2-transport-stream"));
+        assert_eq!(std_uti("m2ts"), Some("public.avchd-mpeg-2-transport-stream"));
+        assert_eq!(std_uti("rmvb"), Some("com.real.realmedia-vbr"));
+        assert_eq!(std_uti("opus"), Some("org.xiph.ogg-audio"));
+        // 旧的错误映射绝不能回来
+        assert_ne!(std_uti("mp4"), Some("com.apple.quicktime-movie"));
+        assert_ne!(std_uti("mkv"), Some("org.matroska.mkv"));
+        assert_ne!(std_uti("wma"), Some("com.microsoft.wma"));
+        assert_ne!(std_uti("opus"), Some("org.xiph.opus"));
+        // 没标准 UTI 的冷门格式返回 None，靠自定义 com.iplayer.<ext> 去争
+        assert_eq!(std_uti("rmvb"), Some("com.real.realmedia-vbr"));
     }
 }

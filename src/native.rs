@@ -103,6 +103,16 @@ mod imp {
             .unwrap_or(false)
     }
 
+    /// 窗口现在是不是被收进了 Dock（黄灯最小化）。
+    ///
+    /// 只读，不碰布局，可以放心在 tick 里每帧调。用来实现"最小化就暂停播放、
+    /// 还原再续上"——见 `App::tick` 里对它的轮询。
+    pub fn is_minimized(window: &Window) -> bool {
+        ns_window(window)
+            .map(|w| w.isMiniaturized())
+            .unwrap_or(false)
+    }
+
     /// 把窗口**藏起来**而不是关掉（红绿灯关闭走这条）。
     ///
     /// 窗口销毁了 App 状态就没了，之后 Dock 点图标也无法"回到主界面"——
@@ -253,7 +263,19 @@ mod imp {
         ) -> *mut core::ffi::c_void;
     }
 
-    const K_LS_ROLES_VIEWER: u32 = 1;
+    // LaunchServices 的角色是**位标志**（不是 0/1 的普通枚举），定义在
+    // `<LaunchServices/LSInfo.h>`：
+    //   kLSRolesNone   = 1 << 0  = 0x0000_0001
+    //   kLSRolesViewer = 1 << 1  = 0x0000_0002
+    //   kLSRolesEditor = 1 << 2  = 0x0000_0004
+    //   kLSRolesShell  = 1 << 3  = 0x0000_0008
+    //   kLSRolesAll    = 0xFFFF_FFFF
+    // 之前误把 Viewer 写成 1（那其实是 None），结果注册成了「无角色」的处理器
+    //（plist 里写成 `LSHandlerRoleNone`），系统双击时按 Viewer 角色查默认，
+    // 自然还是 QuickTime / Music —— 并且系统 UTI（com.apple.quicktime-movie、
+    // public.mp3…）因为本应用只声明了 Viewer 角色，None / All 两种角色都设不上，
+    // 于是那些标准 UTI 一个默认都没登记成功。改成正确的 Viewer 位即可。
+    const K_LS_ROLES_VIEWER: u32 = 0x0000_0002;
     const K_LS_ROLES_ALL: u32 = 0xFFFF_FFFF;
 
     /// 把 iPlayer 设为这些内容类型的默认打开方式。
@@ -263,7 +285,7 @@ mod imp {
     ///
     /// 返回成功设置的个数。必须以 `.app` 形式运行：它认的是 bundle identifier，
     /// 直接跑 `target/release/iplayer` 时拿不到有效的 bundle id。
-    pub fn set_default_role_handler(utis: &[&str]) -> Result<usize, String> {
+    pub fn set_default_role_handler(utis: &[String]) -> Result<usize, String> {
         let bundle = NSBundle::mainBundle();
         let Some(id) = bundle.bundleIdentifier() else {
             return Err("请以 iPlayer.app 的形式运行（直接跑命令行二进制拿不到 bundle id）".into());
@@ -272,8 +294,8 @@ mod imp {
         let mut ok = 0usize;
         let mut first_err = None;
         for uti in utis {
-            let uti = objc2_foundation::NSString::from_str(uti);
-            let status = unsafe {
+            let uti = objc2_foundation::NSString::from_str(uti.as_str());
+            let pstatus = unsafe {
                 LSSetDefaultRoleHandlerForContentType(
                     (&*uti as *const objc2_foundation::NSString).cast(),
                     K_LS_ROLES_VIEWER,
@@ -281,8 +303,8 @@ mod imp {
                 )
             };
             // 角色位可以对不上（某些类型我们只声明了 Viewer），退一步用 "全部角色"
-            let status = if status == 0 {
-                status
+            let astatus = if pstatus == 0 {
+                0
             } else {
                 unsafe {
                     LSSetDefaultRoleHandlerForContentType(
@@ -292,10 +314,13 @@ mod imp {
                     )
                 }
             };
-            if status == 0 {
+            if pstatus == 0 || astatus == 0 {
                 ok += 1;
-            } else if first_err.is_none() {
-                first_err = Some(format!("{uti}: OSStatus {status}"));
+            } else {
+                eprintln!("  !! 设默认失败: {uti}  Viewer={pstatus}  All={astatus}");
+                if first_err.is_none() {
+                    first_err = Some(format!("{uti}: Viewer OSStatus {pstatus}, All OSStatus {astatus}"));
+                }
             }
         }
 
@@ -365,6 +390,11 @@ mod imp {
         false
     }
 
+    /// 别的平台没有"收进 Dock"的概念，永远返回 false（不会触发暂停）。
+    pub fn is_minimized(_window: &Window) -> bool {
+        false
+    }
+
     /// 别的平台把要打开的文件放在命令行参数里（`main` 那边已经处理了），
     /// 没有 Apple Event 那套东西，这个口子永远是空的。
     pub fn open_urls(_urls: Vec<String>) {}
@@ -379,7 +409,7 @@ mod imp {
         None
     }
 
-    pub fn set_default_role_handler(_utis: &[&str]) -> Result<usize, String> {
+    pub fn set_default_role_handler(_utis: &[String]) -> Result<usize, String> {
         Err("这个平台还没有实现「设为默认播放器」".into())
     }
 
@@ -404,6 +434,6 @@ mod imp {
 
 pub use imp::{
     OpenDocWake, async_sheet_available, default_handler_bundle_id, hide_window, is_fullscreen,
-    is_window_zoomed, open_urls, own_bundle_id, set_always_on_top, set_default_role_handler,
-    set_open_doc_wake, show_window, take_open_doc, toggle_fullscreen,
+    is_minimized, is_window_zoomed, open_urls, own_bundle_id, set_always_on_top,
+    set_default_role_handler, set_open_doc_wake, show_window, take_open_doc, toggle_fullscreen,
 };
