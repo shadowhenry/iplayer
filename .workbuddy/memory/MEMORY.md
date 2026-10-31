@@ -88,6 +88,19 @@
   控制条右端 = 静音 · 音量 · 倍速 · 循环 · 切换方向 · 字幕 · 工具箱 · **最大化**（点一下铺满
   屏、再点还原；图标随 `native::is_window_zoomed`（AppKit isZoomed）在 maximize/restore 间切，
   不自己存状态，点绿灯也能同步）。
+- **紧凑模式（2026-10-31 新增）**：窗口整宽 < 760pt 时，控制条右排次组
+  （静音 · 音量 · 倍速 · 循环 · 方向 · 字幕 · 工具箱）整体收起，只留「最大化」图标；
+  窄窗底部只剩「时间 + 播放组 + 最大化」三样。`render_controls` 里算 `narrow =
+  f32::from(window.window_bounds().get_bounds().size.width) < 760.0`，次组用
+  `.when(!narrow, …)` 包住（窄时 div 零宽 = 隐藏）。注意 `Pixels` 字段私有，宽度换算用
+  `f32::from(...)` 而非 `.0`。有 `narrow_window_hides_secondary_controls` /
+  `wide_window_shows_secondary_controls` 两个无头测试钉死。
+- **双击视频要弹出主界面（2026-10-31 新增）**：在 Dock 里最小化时双击音视频，应
+  deminiaturize 出来播放，而不是还缩着。`open_file` 开头置 `raise_on_open = true`
+  （并把 `resume_on_restore` 复位，避免上次最小化暂停的残留误续播）；`tick` 在
+  `pump_open_docs` 之后检查：若 `raise_on_open` 且 `native::is_minimized(window)`，
+  就 `native::show_window(window)`（`deminiaturize`）把它唤出。非最小化时这一位被静默清掉。
+  无头测不了真最小化，用源码扫描钉 `open_file` 置位 + tick 调 `show_window`。
 
 ## 最大化 / 改窗口尺寸的坑（勿回退）
 - **绝不能在事件回调里同步调 AppKit 改窗口尺寸**（如 `NSWindow.zoom:`）：那一刻 App 正被借用，

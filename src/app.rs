@@ -235,6 +235,10 @@ pub struct App {
     /// 只在"最小化时正在播放"才置位，这样纯暂停（用户手动空格暂停）不会被
     /// 还原窗口误触发续播；打开新文件 / 停止时清掉。
     resume_on_restore: bool,
+    /// 新打开了一个媒体文件（访达双击 / 拖放 / 列表点击），如果此刻窗口被
+    /// 收进 Dock，就由 tick 把它 deminiaturize 唤出来 —— 用户要求：双击视频
+    /// 就该弹出主界面播放，而不是还缩在 Dock 里。非最小化时这一位被忽略。
+    raise_on_open: bool,
 
     // — 控制条 —
     /// 0.0 – 1.0 的归一化位置；这样不用因为时长变化去改滑块的 max
@@ -483,6 +487,7 @@ impl App {
             current: None,
             player: None,
             resume_on_restore: false,
+            raise_on_open: false,
             info: None,
             active_path: None,
             stage: Stage::Empty,
@@ -663,6 +668,11 @@ impl App {
 
     fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.release();
+        // 打开新文件是一次全新开始：清掉"因最小化而暂停"的残留标记，
+        // 否则上一个最小化暂停留下的 resume_on_restore 可能误触发续播；
+        // 并置位 raise_on_open —— 若此刻窗口收在 Dock 里，tick 会把它唤出来播放。
+        self.resume_on_restore = false;
+        self.raise_on_open = true;
         // 手调的画面角度是"针对这一个文件"的，换文件就复位；
         // 不然打开一部正常的片子却歪着，比要重调一次更烦人。
         self.orient = Orientation::IDENTITY;
@@ -1328,6 +1338,17 @@ impl App {
         // 放在最前面：不能被后面任何一个提前 return 跳过。
         // （帧循环停着的时候由 `watch_open_docs` 那条常驻任务捞。）
         self.pump_open_docs(cx);
+
+        // 刚才若打开了新文件，且窗口正收在 Dock 里：把它 deminiaturize 唤出来，
+        // 用户双击视频就该看到主界面在播，而不是还缩着。非最小化时这一位无意义，
+        // 直接清掉即可（清在算 min 之前，这样唤出成功的那一帧 min 就是 false，
+        // 下面不会误把它当"最小化暂停"）。
+        if self.raise_on_open {
+            self.raise_on_open = false;
+            if native::is_minimized(window) {
+                native::show_window(window);
+            }
+        }
 
         // 窗口被收进 Dock（黄灯最小化）就暂停，还原再续上 —— 用户要求。
         // 轮询 is_minimized：点最小化那一刻帧循环还在跑（正在播），下一帧就能
@@ -2858,7 +2879,179 @@ impl App {
         let has_player = self.player.is_some();
         let speed_label = format!("{:.1}x", self.speed);
 
-        // 右：音量 / 倍速 / 循环。先单独造好，下面按侧栏状态决定要不要给它套一个等宽槽。
+        // 窗口窄到一定程度，右端那组"音量 / 倍速 / 循环 / 方向 / 字幕 / 工具箱"
+        // 整体收起，只留「最大化」图标 —— 用户要求：窄窗时底部只保留时间、
+        // 播放组、最大化三样。阈值按整窗宽判断（控制条横跨整窗，不被侧栏挤占）。
+        let narrow =
+            f32::from(window.window_bounds().get_bounds().size.width) < 760.0;
+
+        // 次组：音量 / 倍速 / 循环 / 方向 / 字幕 / 工具箱。窄窗时 `.when` 不挂子节点，
+        // 这个 div 就是零宽，整组等于隐藏。
+        let secondary = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(6.))
+            .when(!narrow, |el| {
+                el.child(
+                    self.icon_btn_sz(
+                        "mute",
+                        if self.muted { "volumeX" } else { "volume" },
+                        36.,
+                        PLAY_ICON,
+                        pal.text(),
+                        self.muted,
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_mute(window, cx))),
+                )
+                .child({
+                    // 音量条：组件滑块自带一圈半透明圆底（条色 50%）、hover 时再叠
+                    // 3px 描边环 —— 深色控制条上就是尾巴上那团灰晕（用户视为阴影）。
+                    // 组件没有关掉它们的 API，照搬进度条的做法：组件隐身只留指针
+                    // 交互，条和滑块都自己画 —— 3px 细条 + 实心圆点，无半透明层。
+                    let frac = (self.volume.read(cx).value().start() / 100.0).clamp(0.0, 1.0);
+                    div()
+                        .relative()
+                        .w(px(76.))
+                        .debug_selector(|| "vol-box".to_string())
+                        .child(
+                            // 轨道：底轨 20% + 已播实色，与进度条同一画法
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .top_0()
+                                .bottom_0()
+                                .flex()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .relative()
+                                        .w_full()
+                                        .h(px(3.))
+                                        .rounded_full()
+                                        .bg(pal.text().opacity(0.2))
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .left_0()
+                                                .top_0()
+                                                .bottom_0()
+                                                .w(relative(frac))
+                                                .rounded_full()
+                                                .bg(pal.text()),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            // 滑块：实心圆点，圆心压在已播末端（与组件 thumb 同位，
+                            // 满音量时右半会探出方框 5px —— 与常规滑块一致）
+                            div()
+                                .absolute()
+                                .left(relative(frac))
+                                .top_0()
+                                .bottom_0()
+                                .w(px(10.))
+                                .ml(px(-5.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .w(px(10.))
+                                        .h(px(10.))
+                                        .rounded_full()
+                                        .bg(pal.text()),
+                                ),
+                        )
+                        .child(
+                            Slider::new(&self.volume)
+                                .horizontal()
+                                .bg(pal.text().opacity(0.0))
+                                .text_color(pal.text().opacity(0.0)),
+                        )
+                })
+                .child(
+                    // 单个 chip 循环 0.5 → 3.0（原 Tauri 版是下拉）；
+                    // 键盘 [ / ] 仍可逐级微调
+                    self.chip_bright("speed", &speed_label).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            let next = if this.speed >= 3.0 {
+                                0.5
+                            } else {
+                                (this.speed + 0.5).min(3.0)
+                            };
+                            this.set_speed(next, cx);
+                        }),
+                    ),
+                )
+                .child(
+                    self.icon_btn_sz(
+                        "loop",
+                        match self.loop_mode {
+                            LoopMode::One => "loop1",
+                            _ => "loop",
+                        },
+                        36.,
+                        PLAY_ICON,
+                        // 用户要求右下角图标提亮：不再按开关状态用次要色，
+                        // 开启态靠底色高亮区分
+                        pal.text(),
+                        self.loop_mode.is_on(),
+                    )
+                    .debug_selector(|| "loop".to_string())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.loop_mode = this.loop_mode.next();
+                        let msg = this.loop_mode.toast();
+                        this.toast(msg, cx);
+                    })),
+                )
+                // 「信息」按钮已按用户要求从控制条去掉；浮层仍可用快捷键 i 开关。
+                // 「截图」按钮也去掉了 —— 工具箱面板里本来就有这一项（少一颗重复按钮）。
+                // 循环右边这组"画面 / 窗口工具"（用户指定）：切换方向 · 字幕 · 工具箱 · 最大化。
+                // 前三个原先都在标题栏右上角，那一片现在只剩窗口开关类（深浅色 · 置顶；
+                // 最小化 / 关闭交给 macOS 红绿灯）。全屏没有再给按钮 ——
+                // 绿色交通灯和快捷键 ⌘F 都还在。开关态照旧靠底色高亮，不用暗色。
+                .child(
+                    self.icon_btn_sz(
+                        "ctl-orient",
+                        "rotate",
+                        36.,
+                        PLAY_ICON,
+                        pal.text(),
+                        self.orient_panel || !self.orient.is_identity(),
+                    )
+                    .debug_selector(|| "ctl-orient".to_string())
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_orient_panel(cx))),
+                )
+                // 字幕（用户要求：加在「工具箱」左侧）：导入 / 显示隐藏 / 字号 / 移除
+                .child(
+                    self.icon_btn_sz(
+                        "ctl-sub",
+                        "captions",
+                        36.,
+                        PLAY_ICON,
+                        pal.text(),
+                        self.sub_panel || (self.subs.is_some() && self.sub_visible),
+                    )
+                    .debug_selector(|| "ctl-sub".to_string())
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sub_panel(cx))),
+                )
+                .child(
+                    self.icon_btn_sz(
+                        "ctl-export",
+                        "toolbox",
+                        36.,
+                        PLAY_ICON,
+                        pal.text(),
+                        self.export_panel,
+                    )
+                    .debug_selector(|| "ctl-export".to_string())
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_export_panel(cx))),
+                )
+            });
+
+        // 右：次组（窄窗时零宽隐藏）+ 永远保留在右端的最大化图标。
         let right = div()
             .flex()
             .flex_none()
@@ -2866,149 +3059,7 @@ impl App {
             .gap(px(6.))
             .debug_selector(|| "vol-cluster".to_string())
             .opacity(if has_player { 1.0 } else { 0.45 })
-            .child(
-                self.icon_btn_sz(
-                    "mute",
-                    if self.muted { "volumeX" } else { "volume" },
-                    36.,
-                    PLAY_ICON,
-                    pal.text(),
-                    self.muted,
-                )
-                .on_click(cx.listener(|this, _, window, cx| this.toggle_mute(window, cx))),
-            )
-            .child({
-                // 音量条：组件滑块自带一圈半透明圆底（条色 50%）、hover 时再叠
-                // 3px 描边环 —— 深色控制条上就是尾巴上那团灰晕（用户视为阴影）。
-                // 组件没有关掉它们的 API，照搬进度条的做法：组件隐身只留指针
-                // 交互，条和滑块都自己画 —— 3px 细条 + 实心圆点，无半透明层。
-                let frac = (self.volume.read(cx).value().start() / 100.0).clamp(0.0, 1.0);
-                div()
-                    .relative()
-                    .w(px(76.))
-                    .debug_selector(|| "vol-box".to_string())
-                    .child(
-                        // 轨道：底轨 20% + 已播实色，与进度条同一画法
-                        div()
-                            .absolute()
-                            .left_0()
-                            .right_0()
-                            .top_0()
-                            .bottom_0()
-                            .flex()
-                            .items_center()
-                            .child(
-                                div()
-                                    .relative()
-                                    .w_full()
-                                    .h(px(3.))
-                                    .rounded_full()
-                                    .bg(pal.text().opacity(0.2))
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .left_0()
-                                            .top_0()
-                                            .bottom_0()
-                                            .w(relative(frac))
-                                            .rounded_full()
-                                            .bg(pal.text()),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        // 滑块：实心圆点，圆心压在已播末端（与组件 thumb 同位，
-                        // 满音量时右半会探出方框 5px —— 与常规滑块一致）
-                        div()
-                            .absolute()
-                            .left(relative(frac))
-                            .top_0()
-                            .bottom_0()
-                            .w(px(10.))
-                            .ml(px(-5.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(div().w(px(10.)).h(px(10.)).rounded_full().bg(pal.text())),
-                    )
-                    .child(
-                        Slider::new(&self.volume)
-                            .horizontal()
-                            .bg(pal.text().opacity(0.0))
-                            .text_color(pal.text().opacity(0.0)),
-                    )
-            })
-            .child(
-                // 单个 chip 循环 0.5 → 3.0（原 Tauri 版是下拉）；
-                // 键盘 [ / ] 仍可逐级微调
-                self.chip_bright("speed", &speed_label).on_click(
-                    cx.listener(|this, _, _, cx| {
-                        let next = if this.speed >= 3.0 {
-                            0.5
-                        } else {
-                            (this.speed + 0.5).min(3.0)
-                        };
-                        this.set_speed(next, cx);
-                    }),
-                ),
-            )
-            .child(
-                self.icon_btn_sz(
-                    "loop",
-                    match self.loop_mode {
-                        LoopMode::One => "loop1",
-                        _ => "loop",
-                    },
-                    36.,
-                    PLAY_ICON,
-                    // 用户要求右下角图标提亮：不再按开关状态用次要色，
-                    // 开启态靠底色高亮区分
-                    pal.text(),
-                    self.loop_mode.is_on(),
-                )
-                .debug_selector(|| "loop".to_string())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.loop_mode = this.loop_mode.next();
-                    let msg = this.loop_mode.toast();
-                    this.toast(msg, cx);
-                })),
-            )
-            // 「信息」按钮已按用户要求从控制条去掉；浮层仍可用快捷键 i 开关。
-            // 「截图」按钮也去掉了 —— 工具箱面板里本来就有这一项（少一颗重复按钮）。
-            // 循环右边这组"画面 / 窗口工具"（用户指定）：切换方向 · 字幕 · 工具箱 · 最大化。
-            // 前三个原先都在标题栏右上角，那一片现在只剩窗口开关类（深浅色 · 置顶；
-            // 最小化 / 关闭交给 macOS 红绿灯）。全屏没有再给按钮 ——
-            // 绿色交通灯和快捷键 ⌘F 都还在。开关态照旧靠底色高亮，不用暗色。
-            .child(
-                self.icon_btn_sz(
-                    "ctl-orient",
-                    "rotate",
-                    36.,
-                    PLAY_ICON,
-                    pal.text(),
-                    self.orient_panel || !self.orient.is_identity(),
-                )
-                .debug_selector(|| "ctl-orient".to_string())
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_orient_panel(cx))),
-            )
-            // 字幕（用户要求：加在「工具箱」左侧）：导入 / 显示隐藏 / 字号 / 移除
-            .child(
-                self.icon_btn_sz(
-                    "ctl-sub",
-                    "captions",
-                    36.,
-                    PLAY_ICON,
-                    pal.text(),
-                    self.sub_panel || (self.subs.is_some() && self.sub_visible),
-                )
-                .debug_selector(|| "ctl-sub".to_string())
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_sub_panel(cx))),
-            )
-            .child(
-                self.icon_btn_sz("ctl-export", "toolbox", 36., PLAY_ICON, pal.text(), self.export_panel)
-                    .debug_selector(|| "ctl-export".to_string())
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_export_panel(cx))),
-            )
+            .child(secondary)
             // 最右端（用户要求「右下角增加一个最大化的图标」）：点一下最大化、
             // 再点一下还原。图标按窗口真实状态位切换（`isZoomed`），所以点绿色
             // 交通灯最大化之后这里也会同步变成「还原」的样子。
@@ -5095,13 +5146,22 @@ mod toolbar_width_tests {
     fn harness_at_default_size(
         cx: &mut TestAppContext,
     ) -> (&mut VisualTestContext, Rc<RefCell<Option<Entity<App>>>>) {
+        harness_at(cx, 1180., 760.)
+    }
+
+    /// 用任意窗宽开窗（控制条按整窗宽判断紧凑模式，需要能指定窄窗）。
+    fn harness_at(
+        cx: &mut TestAppContext,
+        w: f32,
+        h: f32,
+    ) -> (&mut VisualTestContext, Rc<RefCell<Option<Entity<App>>>>) {
         cx.update(gpui_kit::init);
         let held: Rc<RefCell<Option<Entity<App>>>> = Rc::new(RefCell::new(None));
         let slot = held.clone();
         let opts = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: Default::default(),
-                size: size(px(1180.), px(760.)),
+                size: size(px(w), px(h)),
             })),
             ..Default::default()
         };
@@ -5142,6 +5202,69 @@ mod toolbar_width_tests {
         assert!(
             gap >= 24.0,
             "默认窗宽下播放组与右侧工具组只剩 {gap:.1}px —— 右排太宽了"
+        );
+    }
+
+    /// 窄窗时底部右排的次组（音量 / 倍速 / 循环 / 方向 / 字幕 / 工具箱）整组收起，
+    /// 只留「最大化」图标 —— 用户要求：窄窗时只保留时间 + 播放组 + 最大化。
+    #[gpui::test]
+    fn narrow_window_hides_secondary_controls(cx: &mut TestAppContext) {
+        // 560 < 760 的紧凑阈值
+        let (cx, _held) = harness_at(cx, 560., 460.);
+
+        // 次组这些图标在窄窗下不应被渲染（debug_selector 找不到）
+        for sel in ["vol-box", "loop", "ctl-orient", "ctl-sub", "ctl-export"] {
+            assert!(
+                cx.debug_bounds(sel).is_none(),
+                "窄窗下 {sel} 应当隐藏，实际被渲染了"
+            );
+        }
+        // 时间、播放组、最大化必须还在
+        for sel in ["ctrl-row", "play-group", "ctl-max"] {
+            assert!(
+                cx.debug_bounds(sel).is_some(),
+                "窄窗下 {sel} 应当保留"
+            );
+        }
+    }
+
+    /// 宽窗时次组照常渲染 —— 别把"窄窗隐藏"误写成"永远隐藏"。
+    #[gpui::test]
+    fn wide_window_shows_secondary_controls(cx: &mut TestAppContext) {
+        let (cx, _held) = harness_at_default_size(cx);
+        for sel in ["vol-box", "loop", "ctl-orient", "ctl-sub", "ctl-export", "ctl-max"] {
+            assert!(
+                cx.debug_bounds(sel).is_some(),
+                "宽窗下 {sel} 应当渲染，实际没有"
+            );
+        }
+    }
+
+    /// 打开一个文件应当置位 `raise_on_open`：若此刻窗口收在 Dock 里，
+    /// tick 会把它 deminiaturize 唤出来播放（用户要求：双击视频就该弹出主界面）。
+    /// 这条用源码扫描钉死接线，因为无头环境没法真正最小化 / deminiaturize。
+    #[test]
+    fn opening_a_file_arms_raise_and_tick_raises_when_minimized() {
+        let app = include_str!("app.rs");
+
+        // ① open_file 必须置位 —— 否则"双击视频弹出主界面"根本不会触发
+        assert!(
+            app.contains("self.raise_on_open = true"),
+            "open_file 必须置位 raise_on_open（在 release 之后、probe 之前）"
+        );
+
+        // ② tick 必须在 raise_on_open 置位、且窗口最小化时调 show_window
+        assert!(
+            app.contains("if self.raise_on_open {"),
+            "tick 必须有「raise_on_open 置位就处理」的分支"
+        );
+        assert!(
+            app.contains(concat!("native::show_", "window(window)")),
+            "tick 在 raise_on_open 且最小化时必须 deminiaturize（native::show_window）"
+        );
+        assert!(
+            app.contains(concat!("native::is_min", "imized(window)")),
+            "tick 的 raise 分支必须只在窗口最小化时才唤出"
         );
     }
 }
