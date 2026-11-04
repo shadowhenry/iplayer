@@ -645,7 +645,7 @@ pub fn probe(path: &Path) -> Result<MediaInfo, String> {
         .arg("-show_streams")
         .arg(path);
 
-    let out = cmd.output().map_err(|e| format!("无法运行 ffprobe: {e}"))?;
+    let out = super::ffmpeg::run_output(&mut cmd).map_err(|e| format!("无法运行 ffprobe: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(format!("无法解析媒体信息: {}", err.trim()));

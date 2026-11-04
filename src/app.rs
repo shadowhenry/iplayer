@@ -4419,12 +4419,11 @@ mod export_click_tests {
             let Ok(mut cmd) = crate::ffmpeg::base_command() else {
                 return;
             };
-            let ok = cmd
-                .args(["-v", "error", "-f", "lavfi", "-i"])
+            cmd.args(["-v", "error", "-f", "lavfi", "-i"])
                 .arg("testsrc=size=160x120:rate=25:duration=1")
                 .args(["-pix_fmt", "yuv420p", "-an", "-y"])
-                .arg(&src)
-                .status()
+                .arg(&src);
+            let ok = crate::ffmpeg::run_status(&mut cmd)
                 .map(|s| s.success())
                 .unwrap_or(false);
             if !ok || !src.exists() {
@@ -4536,12 +4535,11 @@ mod stage_click_tests {
         let path = dir.join("clip.mp4");
         if !path.exists() {
             let mut cmd = crate::ffmpeg::base_command().ok()?;
-            let ok = cmd
-                .args(["-v", "error", "-f", "lavfi", "-i"])
+            cmd.args(["-v", "error", "-f", "lavfi", "-i"])
                 .arg("testsrc=size=160x120:rate=25:duration=4")
                 .args(["-pix_fmt", "yuv420p", "-an", "-y"])
-                .arg(&path)
-                .status()
+                .arg(&path);
+            let ok = crate::ffmpeg::run_status(&mut cmd)
                 .map(|s| s.success())
                 .unwrap_or(false);
             if !ok || !path.exists() {
@@ -5338,12 +5336,11 @@ mod now_playing_tests {
         let path = dir.join("tone.wav");
         if !path.exists() {
             let mut cmd = crate::ffmpeg::base_command().ok()?;
-            let ok = cmd
-                .args(["-v", "error", "-f", "lavfi", "-i"])
+            cmd.args(["-v", "error", "-f", "lavfi", "-i"])
                 .arg("sine=frequency=440:duration=3")
                 .args(["-ac", "2", "-y"])
-                .arg(&path)
-                .status()
+                .arg(&path);
+            let ok = crate::ffmpeg::run_status(&mut cmd)
                 .map(|s| s.success())
                 .unwrap_or(false);
             if !ok || !path.exists() {
@@ -5360,14 +5357,13 @@ mod now_playing_tests {
         let path = dir.join("track.m4a");
         if !path.exists() {
             let mut cmd = crate::ffmpeg::base_command().ok()?;
-            let ok = cmd
-                .args(["-v", "error", "-f", "lavfi", "-i"])
+            cmd.args(["-v", "error", "-f", "lavfi", "-i"])
                 .arg("sine=frequency=660:duration=1")
                 .args(["-ac", "2", "-c:a", "aac", "-metadata"])
                 .arg("title=晴天")
                 .arg("-y")
-                .arg(&path)
-                .status()
+                .arg(&path);
+            let ok = crate::ffmpeg::run_status(&mut cmd)
                 .map(|s| s.success())
                 .unwrap_or(false);
             if !ok || !path.exists() {

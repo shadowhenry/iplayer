@@ -349,7 +349,7 @@ fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| format!("无法启动 ffmpeg: {e}"))?;
+    let mut child = ffmpeg::spawn_child(cmd).map_err(|e| format!("无法启动 ffmpeg: {e}"))?;
     let stdout = child.stdout.take().ok_or("拿不到 ffmpeg 的输出管道")?;
     let stderr = child.stderr.take();
 

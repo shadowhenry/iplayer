@@ -1,177 +1,80 @@
 # iPlayer — 项目长期笔记
 
-## 技术栈
-纯 Rust + GPUI（`gpui-kit 0.7.1` = crates.io `gpui-pre 0.3.8`，不依赖 Zed git），edition 2024。
-旧 Tauri / HTML+CSS+JS / MSE 转码链已全删（README 不许提 WebView / 浏览器）。
-依赖固定版本：`image 0.25.10`（必须与 gpui-pre 同版本，否则 `image::Frame` 不同型）、`resvg 0.46`
-（版本+特性要对齐 gpui-pre 自带那份，否则两套 usvg/tiny-skia）、`cpal 0.16`、`rfd 0.15`、
-`objc2 0.6` + `objc2-app-kit 0.3.2`、`raw-window-handle 0.6`。
-文件：`main.rs` / `app.rs`（唯一 UI）/ `theme.rs` / `ffmpeg.rs` / `media.rs` / `subtitle.rs` /
-`export.rs` / `native.rs` / `icons.rs` / `viz.rs` / `player/*`。
+纯 Rust + GPUI 媒体播放器（macOS），`gpui-kit 0.7.1` = crates.io `gpui-pre 0.3.8`，edition 2024。
+旧 Tauri / WebView 链已全删。固定依赖：`image 0.25.10`、`resvg 0.46`、`cpal 0.16`、`rfd 0.15`、
+`objc2 0.6` + `objc2-app-kit 0.3.2`、`raw-window-handle 0.6`。文件：`main.rs` / `app.rs`（唯一 UI）/
+`theme.rs` / `ffmpeg.rs` / `media.rs` / `subtitle.rs` / `export.rs` / `native.rs` / `player/*`。
 
 ## GPUI 坑（勿回退）
-- 回调里绝不能 panic（objc 边界不能 unwind → abort）；回调里也不许同步弹 rfd 面板（`runModal`
-  会重入挂在主队列上的帧源）。`AsyncFileDialog` 在 `NSApp.isRunning()==false` 时静默退回同步
-  `runModal` → 弹面板前先 `native::async_sheet_available(window)` 自查 + `catch_unwind` 兜底 +
-  必须 `.set_parent()`。导入 / 导出流程 = 记账 → 下一帧 `tick()` 里弹。panic 日志
-  `~/Library/Logs/iPlayer/crash-*.log`。
-- `Window::request_animation_frame()` 只在渲染路径成立（内部 `current_view().last().unwrap()`）；
-  tick 里用它续帧，事件回调一律 `cx.notify()`（有扫源码守卫测试）。
-- render 辅助方法写 `-> impl IntoElement + use<>`；别用 `bool::then(|| self.render_x(cx))`。
-- `WindowOptions::default()` 帧循环不转 → 要 `window_bounds: Some(centered(...))` + `cx.activate(true)`。
-- `SliderState` 的 min/max 只能构造时链式设；0–1 归一化时 `step` 必须一起改小（0.0001），
-  否则指针被吸附到 0/1；`set_value` 要一个它并不用的 `&mut Window`。
-- `RenderImage` 是 BGRA、不是 Clone；`size(0).width.0` 是 i32。
-- `Window::window_handle()` 遮住 `HasWindowHandle::window_handle()` → 取原生句柄写
-  `<Window as HasWindowHandle>::window_handle(window)`。
-- 标题栏：`appears_transparent` + `app_owns_titlebar_drag` + `pl(px(78.))` 让开红绿灯；
-  无头测试不能点标题栏按钮（整条挂着 `start_window_move()`，测试平台 `unimplemented!()`）。
-- `toggleFullScreen:` 前要补 `NSWindowCollectionBehaviorFullScreenPrimary`；`fs_settle` 挡 900ms。
-- **系统「打开文件」（访达双击 / 右键打开方式 / 拖 Dock）绝不能自己挂 `NSAppleEventManager`**
-  处理器（AppKit 在 finishLaunching 会覆盖掉）→ 走 `application.on_open_urls(native::open_urls)`
-  （回调给的是百分号编码 file:// 字符串，`isFileURL()` + `to_file_path()` 解路径）。
-  且帧循环闲着时没人看队列 → native 入队后 `smol::channel` 拍一下，常驻任务
-  `App::watch_open_docs` 醒来 `pump_open_docs`（不是轮询）。接线由
-  `system_open_docs_wiring` 扫源码钉住。
-- 字形覆盖不可靠 → 按钮一律中文小字 chip / 内置 SVG。
-- 浮层与舞台在一条冒泡链上（`Window::hit_test` 反向遍历，同点的 hitbox 全收）→ 绝对定位浮层必须
-  `.id()` + `cx.listener(|_,_,_,cx| cx.stop_propagation())`。
-- 指针回归可无头测：`TestAppContext` + `add_window_view` + `.debug_selector()` + `simulate_mouse_*`；
-  按下前先来一次无按键 `simulate_mouse_move`；拖动要连发几次 move；`debug_bounds` 只认
-  `.debug_selector`（`.id` 不算，要几何断言两个都写），`Pixels` 要 `f32::from(p)`；
-  改 View 状态用 `Entity::update_in(&mut VisualTestContext, |v, window, cx| …)`。
-  `add_window_view` 固定开 1920×1080 → 量"默认窗宽挤不挤"要用 `cx.open_window(...)` +
-  `VisualTestContext::from_window(*h.deref(), cx)`（需 `use std::ops::Deref`）。
-- 挑图标：临时测试里用 resvg 按真实像素（15/19px）放大渲染成 PNG 用 Read 挑。
-- `InputState::set_value` 不发 Change 事件，程序化改完要自己刷列表。
+- 回调里绝不 panic（objc 边界 abort）；不同步弹 rfd 面板（`runModal` 重入帧源）。导入/导出 =
+  记账 → 下一帧 `tick()` 弹。弹面板前 `native::async_sheet_available(window)` 自查 +
+  `catch_unwind` + `.set_parent()`。
+- tick 里续帧用 `window.request_animation_frame()`，事件回调一律 `cx.notify()`。
+- 系统「打开文件」走 `application.on_open_urls(native::open_urls)`，绝不自挂 `NSAppleEventManager`
+  （finishLaunching 会被覆盖）。native 入队后 `smol::channel` 拍一下，`watch_open_docs` 唤醒
+  `pump_open_docs`（非轮询）。
+- 浮层绝对定位必须 `.id()` + `stop_propagation()`；标题栏 `appears_transparent` +
+  `app_owns_titlebar_drag` + `pl(px(78.))` 让红绿灯。
+- 取原生句柄：`<Window as HasWindowHandle>::window_handle(window)`。
+- 倍速 0.5–2.0 走 `atempo`；切换文件先 `self.player = None`。A/V 同步有音轨用音频钟、无则墙钟。
+- 最大化 **只能 `window.zoom_window()`**（GPUI API，丢前台执行器）；事件回调里同步调 AppKit
+  `zoom:` 会布局卡旧尺寸。无头测试平台 `zoom_window` 是 `unimplemented!()`，只钉源码扫描。
+- 改 GPUI 无头测试：宽度用 `cx.open_window(...)` + `VisualTestContext::from_window`，
+  `Pixels` 用 `f32::from(p)` 换算；`debug_bounds` 只认 `.debug_selector`。
 
-## 播放内核（勿回退）
-- seek / 换角度重开解码时绝不把 `current` 清成 None（只把 `current_pts` 归 -1）；
-  冻结条件抽成 `freeze_current(playing, has_current, awaiting)`，`App::tick` 的 busy 要算上 `awaiting()`。
-- `ended()` 只认通道 `Closed`（`Empty` 只是这一帧还没解出来）且要求 `current_pts >= 0`；
-  `empty_spawn` 直接判播完。
-- 拖动只 `Player::scrub()`（只重开视频），松手才 `seek()`；`SCRUB_INTERVAL` 90ms 节流。
-- A/V 同步：有音轨以音频钟为准，无音频回退墙钟；取 `pts <= pos + 0.004` 的最新帧，早于 0.5s 丢；
-  背压用有界 channel(3) + `try_send`。
-- 倍速走 `atempo` 链（0.5–2.0 步进）；切换文件先 `self.player = None` 彻底交出。
-- 画面朝向 `Orientation{rot,flip_h,flip_v}` 是屏幕空间语义；视频（滤镜）/图片（CPU 搬像素）两套实现，
-  由 `--selftest` 逐像素核对钉住，改一处两边一起改。
-- 动图（GIF / 动画 WebP）先过 `fps=` 归一化；图片解码三条路 SVG(resvg) / image crate / ffmpeg 兜底
-  （tiny-skia 给预乘 RGBA，要先除回 alpha）。
-- sidecar 名一律经 `ffmpeg::exe_name()` 拼 `EXE_SUFFIX`（Windows `Path::is_file()` 不补扩展名）。
-- `[profile.release] strip = "debuginfo"`（别写 true）+ `panic = "unwind"`。
+## 显存 / 纹理（「播久了自动崩」根因，勿回退）
+GPUI 精灵图集只增不减，每解一帧造新 `RenderImage` → 每帧留一块大纹理（720p 实测 +120MB/s，
+几分钟被系统 SIGKILL 且无 panic 日志）。正解：`App.shown_frame` 记上一帧纹理，
+`render_stage` 里 `needs_retire` 为真就 `window.drop_image(旧)`；判据只看 id，画面消失也要撤。
+钉子 `frame_retire_tests`。查崩用 `footprint -p <pid>` 看 `phys_footprint`。
 
-## 显存 / 纹理（勿回退）——「播久了自动崩」的根因
-- **GPUI 的精灵图集只增不减**：`AtlasState::tiles_by_key` 对每个没见过的
-  `RenderImage::id` 分配一块 tile（etagere），**只有显式 `Window::drop_image()` 才回收**，
-  没有任何自动 GC。播放器每解一帧就造一个新 `RenderImage`（新 id），所以
-  **每帧都在显存里留一块大纹理** —— 实测 720p 片子 `phys_footprint` **+120MB/s**，
-  播几分钟被系统干掉，**且不留 panic 日志**（不是 panic，是资源限制杀进程，最难查）。
-- 正解：`App.shown_frame: Option<Arc<RenderImage>>` 记「上一帧画到屏幕上的纹理」，
-  `render_stage` 里 `needs_retire(旧 id, 新 id)` 为真就 `let _ = window.drop_image(旧)`。
-  判据只看 `id`（同一帧反复取出来 —— 暂停冻结 / 拖动停住 —— 不能白撤）；
-  画面来源整个消失（切图片 / 音频 / 空舞台）也要撤。`apply_orientation` 换静态图纹理同理。
-  撤掉的 tile 若还被上一帧场景引用，macOS 渲染器会跳过（gpui-pre-apple `metal_atlas.rs` 注释）。
-- 验证：实测 +120MB/s → **3 分钟 135→143MB 水平**；钉子 `frame_retire_tests`
-  （真值表 + 源码扫描 `render_stage`/`apply_orientation` 必须调 `drop_image`），回退确认变红。
-- 排查手法：`footprint -p <pid>`（RSS 看不全，共享模式的 Metal 纹理要 `phys_footprint`）；
-  `.ips` 崩溃报告里 `SIGKILL (Code Signature Invalid)` 是 `cp` 覆盖 app 内二进制导致，与本条无关。
+## 外部进程（ffmpeg/ffprobe）EAGAIN 重试（2026-11-04）
+- 现象：系统进程数逼近上限时 `posix_spawn`/`fork` 返回 **EAGAIN (os error 35)**，iPlayer 原把
+  它当硬失败弹「无法运行 ffprobe/ffmpeg」。这是**瞬时**资源紧张，稍等重试即可。
+- 正解：`ffmpeg.rs` 加 `run_output` / `run_status` / `spawn_child`（均取 `&mut Command`，
+  只对 `raw_os_error()==Some(35)` 重试，最多 6 次、退避 30→500ms；其它错误立即上抛不重试）。
+  所有 ffprobe/ffmpeg 执行点都改走这三个助手：媒体探测 `media.rs::probe`、解码单帧
+  `player/mod.rs`、`audio.rs`/`video.rs` 解码线程 `spawn_child`、`export.rs` 转码、以及
+  工具发现 `works()`/版本探测。**注意 `Command::output/status/spawn` 取 `&mut self` 不消费**，
+  所以重试直接复用同一 `&mut Command`，无需 clone。
+- 测试 `retry_tests` 钉：成功路径正常、非 EAGAIN 错误 200ms 内立即返回（不卡退避）。
 
-## UI 规范（用户明确要求）
-- 画面适配一律 `ObjectFit::Contain`（绝不用 Fill）；静态图片按原尺寸、不放大；黑白单色（不用蓝色）；
-  控制条无顶部分隔线；播放组始终整行居中（左右各一个 1fr 槽配对）。
-  舞台容器本身已贴窗口左右边缘（逐像素核对过）；用户看到的左右黑边是画面比例留下的，
-  2026-10-09 用户确认**不改**。真要贴边只有 Cover 一条路（裁掉超出方向），别再动。
-- 按钮排布：标题栏右上角 = 深浅色 · 置顶（**最小化 / 最大化 / 关闭X 三颗已按用户要求整个移除**，
-  这三件事交给 macOS 红绿灯；`native::minimize_window`/`zoom_window` 和 `minimize`/`maximize`
-  图标定义也随之删了，有测试钉住别长回来）；
-  控制条右端 = 静音 · 音量 · 倍速 · 循环 · 切换方向 · 字幕 · 工具箱 · **最大化**（点一下铺满
-  屏、再点还原；图标随 `native::is_window_zoomed`（AppKit isZoomed）在 maximize/restore 间切，
-  不自己存状态，点绿灯也能同步）。
-- **紧凑模式（2026-10-31 新增）**：窗口整宽 < 760pt 时，控制条右排次组
-  （静音 · 音量 · 倍速 · 循环 · 方向 · 字幕 · 工具箱）整体收起，只留「最大化」图标；
-  窄窗底部只剩「时间 + 播放组 + 最大化」三样。`render_controls` 里算 `narrow =
-  f32::from(window.window_bounds().get_bounds().size.width) < 760.0`，次组用
-  `.when(!narrow, …)` 包住（窄时 div 零宽 = 隐藏）。注意 `Pixels` 字段私有，宽度换算用
-  `f32::from(...)` 而非 `.0`。有 `narrow_window_hides_secondary_controls` /
-  `wide_window_shows_secondary_controls` 两个无头测试钉死。
-- **双击视频要弹出主界面（2026-10-31 新增）**：在 Dock 里最小化时双击音视频，应
-  deminiaturize 出来播放，而不是还缩着。`open_file` 开头置 `raise_on_open = true`
-  （并把 `resume_on_restore` 复位，避免上次最小化暂停的残留误续播）；`tick` 在
-  `pump_open_docs` 之后检查：若 `raise_on_open` 且 `native::is_minimized(window)`，
-  就 `native::show_window(window)`（`deminiaturize`）把它唤出。非最小化时这一位被静默清掉。
-  无头测不了真最小化，用源码扫描钉 `open_file` 置位 + tick 调 `show_window`。
+## UI 规范（用户明确要求，勿回退）
+- 画面 `ObjectFit::Contain`（绝不用 Fill）；控制条无顶部分隔线；播放组整行居中。
+  舞台已贴窗左右边，左右黑边是比例留的（2026-10-09 确认不改）。
+- 标题栏右上角 = 深浅色 · 置顶（最小化/最大化/关闭三颗已删，交 macOS 红绿灯）；
+  控制条右端 = 静音·音量·倍速·循环·方向·字幕·工具箱·**最大化**（图标随
+  `native::is_window_zoomed` 切 maximize/restore）。
+- **紧凑模式（2026-10-31）**：整窗宽 `f32::from(window.window_bounds().get_bounds().size.width)
+  < 760.0` 时，右排次组用 `.when(!narrow, …)` 收起，窄窗只留「时间+播放组+最大化」。
+  钉子 `narrow_window_hides_secondary_controls` / `wide_window_shows_secondary_controls`。
+- **双击视频弹出主界面（2026-10-31）**：Dock 最小化时双击音视频应 deminiaturize 出来播。
+  `open_file` 置 `raise_on_open`（并复位 `resume_on_restore`）；`tick` 在 `pump_open_docs` 后
+  若 `raise_on_open && native::is_minimized` 就 `native::show_window`（deminiaturize）。
+- 面板（角度/导出/字幕）在舞台右下角、互斥、停靠 10s 自动收（`PANEL_TTL=10s`，`tick` 判超时）。
+  字幕浮层底部居中；音频曲名浮层 30% 高。倍速 0.5–3.0 步进 0.5。
 
-## 最大化 / 改窗口尺寸的坑（勿回退）
-- **绝不能在事件回调里同步调 AppKit 改窗口尺寸**（如 `NSWindow.zoom:`）：那一刻 App 正被借用，
-  AppKit 改完尺寸回调 `set_frame_size`（gpui-pre-macos window.rs:3253，被 swizzle 的 setFrameSize:），
-  GPUI 的 `bounds_changed` 走 `handle.update(…).log_err()` 被吞 → 布局停在旧尺寸，
-  表现就是用户报的「窗口大了、播放区还是小的」。
-- 正解：`window.zoom_window()`（GPUI 自己的 API，内部把原生调用丢到前台执行器稍后执行）。
-  三个真平台都实现了 zoom；只有**无头测试平台是 `unimplemented!()`**（platform/test/window.rs:451），
-  所以无头测试点不了最大化按钮，只钉了源码扫描（必须 `window.zoom_window()`、禁 `native::`、
-  native.rs 禁同步 `win.zoom(`）+ 图标映射 + 几何。真机行为靠临时 `IPLAYER_DEMO_ZOOM` 帧计数
-  诊断开关截图验证过（最大化/还原都正常），验证完已删。
-- 图标分工：循环 = 环形箭头 `loop`/`loop1`（单曲带中心 "1"）；画面角度 = 方框+内部弧箭头 `rotate`；
-  字幕 = `captions`（圆角框 + 两条短横线）。旧 `repeat`/`repeat1` 已删（有测试钉住）。
-- 角度面板 / 导出面板 / 字幕面板都在舞台右下角（`right/bottom 12px`），三者互斥不叠。
-  **停靠 10 秒没人碰就自动收起**（用户要求，别一直挂着）：`panel_seen: Option<Instant>` 记
-  "最近活动时刻"，`PANEL_TTL = 10s`；`note_activity()` 挂在根节点的 `on_mouse_move` +
-  `capture_any_mouse_down` 和键盘上（GPUI 没被 occlude 的祖先都在 hover 链上，根节点收得到全窗口动作）；
-  判超时在 `tick` 里（面板开着时每帧 `request_animation_frame` 续帧，否则帧循环一停就没人看表）；
-  导出任务 / 文件面板挂着时不算"没人用"。Esc 走 `close_panels()`。
-- 侧栏行文本 `.flex_1().min_w(px(0.)).truncate()`；倍速 0.5–3.0 步进 0.5；「清空列表」只丢列表不停播放。
-- 点播放区域 = 播放 / 暂停（浮层自己 stop_propagation）。
-- 音频舞台曲名浮层（`now_playing`）：音符 + 一行名字，横向居中，纵向钉在 30% 高处（频谱柱最高 41%）；
-  名字取 `song_title(tag, path)`（容器标签 title 优先，退回文件名；`MediaInfo.title`）。
-- 字幕浮层：底部居中（下边距 6%），多行逐行渲染，深色半透明底 + 白字（任何画面上都可读）；
-  打开文件时自动找同名 sidecar（`.srt`/`.ass`/`.vtt`）。
+## 文件关联 / 默认播放器（静默、不弹框）
+- `media.rs`：每扩展名申 `com.iplayer.<ext>` UTI + `UTImportedTypeDeclarations`；
+  `CFBundleDocumentTypes` 音视频 `LSHandlerRank=Default`、图片 `Alternate`（不抢 Preview）。
+  `std_uti(ext)` 必须对齐系统真实 UTI（见 `std_uti_matches_system_utis` 测试），否则
+  `LSSetDefaultRoleHandlerForContentType` 吃 `-50` 跳过。关键映射：mp4→`public.mpeg-4`、
+  mkv→`com.blurayplayersoftware.matroska`、wma→`com.microsoft.windows-media-wma`、
+  m4v→`com.apple.m4v-video`、avi→`public.avi`、flv→`com.adobe.flash.video`、
+  wmv→`com.microsoft.windows-media-wmv`、ts→`public.mpeg-2-transport-stream`、
+  m2ts/mts→`public.avchd-mpeg-2-transport-stream`、rmvb→`com.real.realmedia-vbr`、opus→`org.xiph.ogg-audio`。
+- **静默设默认（务必记牢）**：绝不调会弹确认框的 `LSSetDefaultRoleHandlerForContentType`
+  （覆盖 TV/XLPlayer 时每格式弹一次，几十次点击）。正解：直接改写
+  `~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist` 的
+  `LSHandlers`，每个 uti 写 `LSHandlerRoleAll = com.iplayer.app`，写完 **双 kill**
+  `killall -u $USER cfprefsd` **和 `lsd`**（只杀 cfprefsd 不够，lsd 不重载就仍读旧库）。
+- `check_default_player` 首 tick 静默自动设一次（幂等），判据用具体 UTI `public.mpeg-4`。
 
-## 文件关联 / 默认播放器（2026-10-28 新增，当日修过两版）
-- 之前"双击音视频没用 iPlayer 开"的根因：冷门格式（mkv/avi/flv/rmvb/wma/ape…）macOS **没有系统 UTI**，
-  只声明 `public.movie`/`public.audio` 永远关联不上它们。
-- 正解（`media.rs`）：每个扩展名申自定义 UTI `com.iplayer.<ext>` 并 `UTTypeConformsTo` 父类，
-  写进 `Info.plist` 的 `UTImportedTypeDeclarations`（见 `doc_types_plist`）；`CFBundleDocumentTypes`
-  里**音视频 `LSHandlerRank=Default`、图片 `Alternate`**（不抢 Preview）。`std_uti(ext)` 把每个扩展名
-  映射到系统**实际的** UTI（见下），`all_utis()` 只收音视频（大类+`std_uti`+自定义 UTI），图片排除。
-- `std_uti()` 映射**必须和 `UTTypeCreatePreferredIdentifierForTag("public.filename-extension", ext)` 查到的
-  实际 UTI 一致**，否则 `LSSetDefaultRoleHandlerForContentType` 吃 `paramErr(-50)` 直接跳过、那个格式
-  永远争不到默认。易错映射（已钉进 `std_uti_matches_system_utis` 测试）：mp4→`public.mpeg-4`（不是
-  quicktime-movie）、mov→`com.apple.quicktime-movie`、m4v→`com.apple.m4v-video`、mkv→
-  `com.blurayplayersoftware.matroska`（不是 `org.matroska.mkv`）、wma→`com.microsoft.windows-media-wma`
-  （不是 `com.microsoft.wma`）、opus→`org.xiph.ogg-audio`（opus 没独立 UTI）、avi→`public.avi`、
-  flv/f4v→`com.adobe.flash.video`、wmv→`com.microsoft.windows-media-wmv`、ts→
-  `public.mpeg-2-transport-stream`、m2ts/mts→`public.avchd-mpeg-2-transport-stream`、rmvb→
-  `com.real.realmedia-vbr`。`set_utis` 里另放 `org.matroska.mkv`/`com.microsoft.wma` 作跨机别名兜底。
-- **默认播放器设法的坑（务必记牢）**：`LSSetDefaultRoleHandlerForContentType`（LaunchServices 公开 API）
-  在**覆盖已有默认**（TV / QuickTime / XLPlayer）时会**每个格式弹一次确认框**
-  （"要通过 iPlayer 打开所有 .m4v 的文稿，还是继续使用 TV？"）。在 `check_default_player` 里
-  **自动调用**它 = 几十个格式 = 几十次点击，用户炸毛。**正解**：`set_default_role_handler` 改成
-  **直接改写** `~/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist`
-  的 `LSHandlers`，给每个 uti 写一条 `LSHandlerRoleAll = com.iplayer.app`（python3 做 plist 读写，写完
-  `killall -u $USER cfprefsd` **和 `lsd`** 重新加载），**静默、不弹框**，且能真覆盖所有声明过的格式
-  （和 VLC/IINA 一个路数）。C-API 路径留作 python 缺失时的兜底（`set_defaults_via_lsapi`）。
-- **关键坑（2026-10-29 修正旧结论）**：只 `killall cfprefsd` **不够** —— LaunchServices 守护进程 `lsd`
-  缓存着默认应用数据库，不重启它，`LSCopyDefaultRoleHandlerForContentType` / 访达双击**读不到**我们刚写的
-  plist，于是 m4v/mkv/avi/flv/wmv/wma/ts/m2ts/rmvb 这 9 种继续开 TV/XLPlayer。曾经误判成"macOS 锁定、
-  第三方静默抢不了"——**错**。真相是 lsd 没重载。脚本里**多 kill 一个 `lsd`** 后，27 种格式全部静默默认
-  iPlayer（含那 9 种），`NSWorkspace URLForApplicationToOpenURL:` 探针全绿。改这条务必保留双 kill。
-- `check_default_player()` 启动首 tick 检测到非默认就**自动设一次**（幂等、静默），判据用具体 UTI
-  `public.mpeg-4`（非抽象父类 `public.movie`，否则"设了还被认为不是默认"每启重写）；`is_default_player`
-  置位后不再触发。改这条接线先临时回退确认变红。
-
-## 最小化暂停（2026-10-28 新增）
-- 用户要求：窗口最小化就停播。`tick` 每帧轮询 `native::is_minimized`（macOS 走 NSWindow
-  `isMiniaturized`，非 macOS 返回 false）；最小化且正在播 → `player.pause()` 并置
-  `resume_on_restore`，还原后 `player.play()` 续播；纯手动暂停不被还原误续。`busy` 计入 `|| min`
-  保证最小化期间帧循环不停、还原能被捕获。`stop()` 清 `resume_on_restore`。
+## 最小化暂停（2026-10-28）
+窗口最小化即 `player.pause()` + 置 `resume_on_restore`，还原后续播；`busy` 计入 `|| min`
+保证帧循环不停。`stop()` 清标记。纯手动暂停不被还原误续。
 
 ## 打包 / 验证
-- `scripts/bundle-macos.sh`（`--dmg` / `--zip` / `--run` / `--install`）；`bundle-windows.ps1`（未实跑）/
-  `bundle-linux.sh`（`bash -n` 过）。**`cp` 覆盖 .app 内二进制会破坏签名 → macOS 静默 SIGKILL**，
-  必须走 `--install`。
-- 回归：`cargo test` + `--selftest`（解码 / seek / 倍速 / 暂停冻结 / 模拟拖动黑屏采样为 0 /
-  导出任务真跑校验 magic）。写完钉子要临时回退旧行为确认变红。
-- GUI 只能靠"进程存活 + 临时 trace 文件"；下 GitHub 走 `socks5h://127.0.0.1:7897`；
-  `binaries/` 里下载的 ffmpeg 没有执行位，要 `chmod 755`。
-- 拖放：`on_drop` 的参数类型必须与 active_drag 的值类型一致（外部文件是 `&ExternalPaths`）。
+- `scripts/bundle-macos.sh --install`（绝不用 `cp` 覆盖 .app 内二进制，会破坏签名 → 静默 SIGKILL）。
+- 回归：`cargo test` + `--selftest`（解码/seek/倍速/暂停冻结/导出真跑校验）。写完钉子先临时
+  回退确认变红。`binaries/` 里 ffmpeg 无执行位要 `chmod 755`；下 GitHub 走 `socks5h://127.0.0.1:7897`。

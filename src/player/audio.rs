@@ -422,7 +422,7 @@ fn decode_loop(
     cancel: Arc<Cancel>,
     child_slot: Arc<Mutex<Option<Child>>>,
 ) {
-    let mut child = match cmd.spawn() {
+    let mut child = match ffmpeg::spawn_child(&mut cmd) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[audio] 无法启动 ffmpeg: {e}");

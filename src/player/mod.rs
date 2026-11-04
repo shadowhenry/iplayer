@@ -322,7 +322,7 @@ fn load_still_via_ffmpeg(path: &Path, max_side: u32) -> Result<Arc<RenderImage>,
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
-    let out = cmd.output().map_err(|e| format!("无法运行 ffmpeg: {e}"))?;
+    let out = crate::ffmpeg::run_output(&mut cmd).map_err(|e| format!("无法运行 ffmpeg: {e}"))?;
     let need = (w as usize) * (h as usize) * 4;
     if out.stdout.len() < need {
         return Err("ffmpeg 没有吐出完整的画面".to_string());
@@ -400,12 +400,11 @@ mod tests {
             let Ok(mut cmd) = crate::ffmpeg::base_command() else {
                 return; // 没有 ffmpeg：跳过，不把环境问题算成回归
             };
-            let ok = cmd
-                .args(["-v", "error", "-f", "lavfi", "-i"])
+            cmd.args(["-v", "error", "-f", "lavfi", "-i"])
                 .arg("testsrc=size=160x120:rate=25:duration=4")
                 .args(["-pix_fmt", "yuv420p", "-an", "-y"])
-                .arg(&path)
-                .status()
+                .arg(&path);
+            let ok = crate::ffmpeg::run_status(&mut cmd)
                 .map(|s| s.success())
                 .unwrap_or(false);
             if !ok || !path.exists() {

@@ -469,7 +469,7 @@ fn decode_loop(
     child_slot: Arc<Mutex<Option<Child>>>,
     ended: Arc<AtomicBool>,
 ) {
-    let mut child = match cmd.spawn() {
+    let mut child = match ffmpeg::spawn_child(&mut cmd) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[player] 无法启动 ffmpeg: {e}");

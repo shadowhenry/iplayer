@@ -80,14 +80,12 @@ fn candidates(name: &str) -> Vec<PathBuf> {
 /// Verify a candidate actually runs before committing to it — a bundled binary
 /// can be present but fail to load (e.g. missing dylibs).
 fn works(path: &Path) -> bool {
-    Command::new(path)
-        .arg("-version")
+    let mut cmd = Command::new(path);
+    cmd.arg("-version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .stderr(Stdio::null());
+    run_status(&mut cmd).map(|s| s.success()).unwrap_or(false)
 }
 
 fn resolve(name: &str, cache: &'static OnceLock<Option<PathBuf>>) -> Option<PathBuf> {
@@ -133,7 +131,11 @@ pub fn status() -> ToolStatus {
     let fp = ffprobe().ok();
     let version = ff
         .as_ref()
-        .and_then(|p| Command::new(p).arg("-version").output().ok())
+        .and_then(|p| {
+            let mut c = Command::new(p);
+            c.arg("-version");
+            run_output(&mut c).ok()
+        })
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.lines().next().map(|l| l.trim().to_string()));
 
@@ -199,6 +201,83 @@ pub fn base_ffprobe_command() -> Result<Command, String> {
     Ok(cmd)
 }
 
+/// 运行外部命令并捕获 stdout/stderr，在 `EAGAIN`（Resource temporarily
+/// unavailable，os error 35）时自动重试。
+///
+/// macOS 在系统进程数逼近上限时会让 `posix_spawn`/`fork`+exec 返回 EAGAIN，
+/// 稍等片刻重试通常就能成功 —— 否则用户会看到一个硬失败（例如「无法运行
+/// ffprobe」的提示）。只有这一类瞬时错误才重试，文件找不到 / 权限等其它错误
+/// 直接原样返回。最多重试 6 次，退避 30ms→60ms→120ms→240ms→500ms→500ms。
+pub fn run_output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    const RETRIES: u32 = 6;
+    let mut backoff = std::time::Duration::from_millis(30);
+    let mut last = None;
+    for attempt in 0..=RETRIES {
+        match cmd.output() {
+            Ok(o) => return Ok(o),
+            Err(e) if e.raw_os_error() == Some(35) => {
+                last = Some(e);
+                if attempt < RETRIES {
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(std::time::Duration::from_millis(500));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "ffmpeg/ffprobe 执行失败")
+    }))
+}
+
+/// 同 [`run_output`]，但只关心退出状态（不捕获输出），对应 `.status()`。
+pub fn run_status(cmd: &mut Command) -> std::io::Result<std::process::ExitStatus> {
+    const RETRIES: u32 = 6;
+    let mut backoff = std::time::Duration::from_millis(30);
+    let mut last = None;
+    for attempt in 0..=RETRIES {
+        match cmd.status() {
+            Ok(s) => return Ok(s),
+            Err(e) if e.raw_os_error() == Some(35) => {
+                last = Some(e);
+                if attempt < RETRIES {
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(std::time::Duration::from_millis(500));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "ffmpeg/ffprobe 执行失败")
+    }))
+}
+
+/// 同 [`run_output`]，但保留子进程管道（需要边读 stdout/stderr 边处理时用），
+/// 对应 `.spawn()`。同样在 `EAGAIN` 时重试。
+pub fn spawn_child(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    const RETRIES: u32 = 6;
+    let mut backoff = std::time::Duration::from_millis(30);
+    let mut last = None;
+    for attempt in 0..=RETRIES {
+        match cmd.spawn() {
+            Ok(c) => return Ok(c),
+            Err(e) if e.raw_os_error() == Some(35) => {
+                last = Some(e);
+                if attempt < RETRIES {
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(std::time::Duration::from_millis(500));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "ffmpeg/ffprobe 启动失败")
+    }))
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::{sidecar_files, TARGET_TRIPLE};
@@ -212,5 +291,42 @@ mod tests {
         assert_eq!(files[1], format!("ffmpeg-{TARGET_TRIPLE}{}", std::env::consts::EXE_SUFFIX));
         #[cfg(target_os = "windows")]
         assert!(files.iter().all(|f| f.ends_with(".exe")));
+    }
+}
+
+/// EAGAIN 重试助手的行为钉死：成功路径正常返回，非 EAGAIN 错误立即上抛
+/// （不重试、不卡退避），避免把"文件不存在"这类真错误拖成几秒的卡顿。
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn run_output_succeeds_normally() {
+        let mut cmd = Command::new("/bin/echo");
+        cmd.arg("hi");
+        let out = run_output(&mut cmd).expect("echo 应当成功");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("hi"));
+    }
+
+    #[test]
+    fn run_status_succeeds_normally() {
+        let mut cmd = Command::new("/bin/echo");
+        cmd.arg("ok");
+        let st = run_status(&mut cmd).expect("echo 应当成功");
+        assert!(st.success());
+    }
+
+    #[test]
+    fn non_eagain_error_propagates_immediately() {
+        let mut cmd = Command::new("/nonexistent/iplayer-test-bin-xyz");
+        let start = std::time::Instant::now();
+        let res = run_output(&mut cmd);
+        assert!(res.is_err(), "不存在的可执行文件应直接报错");
+        // 非 EAGAIN 错误必须立即返回，不能因为重试退避而变慢
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(200),
+            "非 EAGAIN 错误被错误地重试了"
+        );
     }
 }
